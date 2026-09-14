@@ -1,0 +1,56 @@
+# Local environments and caches
+.tracecredit*.git/
+.conda/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+*.egg-info/
+
+# Models, checkpoints, and experiment artifacts
+models/
+verl_checkpoints/
+outputs/
+rollouts/
+wandb/
+verl_log/
+pipeline_state/
+evaluation/
+tests/
+services/
+
+# Generated or local datasets
+data/
+*.parquet
+*.arrow
+
+# Large generated documents and archives
+*.pdf
+*paper*.md
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Local experiment notes and one-off launch artifacts
+*_REPORT.md
+*_SUMMARY.md
+BRANCH_CREDIT_TREE_GRPO_PLAN.md
+Tree-GRPO.md
+paper_full.md
+branch_credit_*comparison.json
+branch_outcome_prior_calibration_*.json
+
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
