@@ -68,7 +68,16 @@ except ImportError:
 
 from tqdm import tqdm
 
-from verl.utils import hf_processor, hf_tokenizer
+from verl.utils import hf_tokenizer
+
+try:
+    from verl.utils import hf_processor
+except ImportError:
+    # This project predates verl's multimodal processor helper.  Text-only
+    # checkpoints (including the Qwen2.5 actor used here) have no processor to
+    # copy, so keep the newer merger compatible with the older utility module.
+    def hf_processor(_name_or_path):
+        return None
 
 
 @dataclass

@@ -98,8 +98,23 @@ class RewardManager():
         return all_scores, reward_tensor
 
 
+import os
+
 import ray
 import hydra
+
+
+def _optional_positive_int_env(name):
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value == '':
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f'{name} must be a positive integer, got {raw_value!r}') from exc
+    if value <= 0:
+        raise ValueError(f'{name} must be a positive integer, got {raw_value!r}')
+    return value
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
@@ -107,12 +122,33 @@ def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
         print("Ray is not initialized! run ray.init()...")
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray_init_kwargs = {}
+        ray_num_cpus = _optional_positive_int_env('TREE_GRPO_RAY_NUM_CPUS')
+        ray_object_store_mib = _optional_positive_int_env(
+            'TREE_GRPO_RAY_OBJECT_STORE_MEMORY_MIB'
+        )
+        if ray_num_cpus is not None:
+            ray_init_kwargs['num_cpus'] = ray_num_cpus
+        if ray_object_store_mib is not None:
+            ray_init_kwargs['object_store_memory'] = ray_object_store_mib * 1024 * 1024
+        print(f'Ray resource overrides: {ray_init_kwargs or "defaults"}')
+        ray.init(
+            runtime_env={
+                'env_vars': {
+                    'TOKENIZERS_PARALLELISM': 'true',
+                    'NCCL_DEBUG': 'WARN',
+                }
+            },
+            **ray_init_kwargs,
+        )
     print("Ray already initialized. Get remote ...")
     ray.get(main_task.remote(config))
 
 
-@ray.remote
+# Do not retry the controller task inside a damaged Ray session.  Its named
+# placement group survives a memory-kill long enough to collide with an
+# in-session retry; the detached service performs a clean process restart.
+@ray.remote(max_retries=0)
 def main_task(config):
     from verl.utils.fs import copy_local_path_from_hdfs
     from transformers import AutoTokenizer

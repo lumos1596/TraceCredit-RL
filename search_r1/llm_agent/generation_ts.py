@@ -15,6 +15,7 @@ import random
 import numpy as np
 
 from .tree_node import TreeNode, DEBUG, dprint
+from .self_opd import build_self_opd_batch
 
 
 @dataclass
@@ -53,6 +54,18 @@ class GenerationTreeSearchConfig:
     branch_credit_no_sibling: str = 'zero'
     branch_credit_value_mode: str = 'reward'
     branch_credit_correctness_threshold: float = 0.8
+    enable_self_opd: bool = False
+    self_opd_max_events: int = 3
+    self_opd_max_teacher_length: int = 1024
+    self_opd_max_query_tokens: int = 64
+    self_opd_max_action_tokens: int = 256
+    self_opd_max_evidence_tokens: int = 128
+    self_opd_min_value_gap: float = 0.25
+    self_opd_min_raw_advantage: float = 0.0
+    self_opd_max_advantage_weight: float = 3.0
+    self_opd_teacher_context: str = 'hindsight'
+    self_opd_event_selection: str = 'contrast'
+    self_opd_analyzer_url: str = ''
 
     def __post_init__(self):
         if self.expand_mode not in TreeNode.EXPAND_MODES:
@@ -131,6 +144,8 @@ class LLMGenerationTreeSearchManager:
                 'branch_credit_value_mode must be either reward or correctness, '
                 f'got {config.branch_credit_value_mode!r}'
             )
+        if config.enable_self_opd and not config.enable_branch_credit:
+            raise ValueError('Self-OPD currently requires the branch_credit estimator')
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -945,6 +960,40 @@ class LLMGenerationTreeSearchManager:
                 final_output.batch[f'branch_credit_{stat_key}'] = torch.tensor(
                     values, dtype=torch.float32, device=final_responses.device
                 ).unsqueeze(-1)
+
+        if self.config.enable_self_opd:
+            # Gold answers are used only by the builder's redactor.  The
+            # hindsight teacher never receives them in its input sequence.
+            reward_models = gen_batch.non_tensor_batch.get('reward_model', None)
+            gold_answers = []
+            for node_index in range(len(final_node_list)):
+                answer = ''
+                if reward_models is not None:
+                    reward_model = reward_models[node_index // self.config.k]
+                    if isinstance(reward_model, dict):
+                        target = (reward_model.get('ground_truth') or {}).get('target')
+                        if isinstance(target, (list, tuple, np.ndarray)):
+                            target = target[0] if len(target) else ''
+                        answer = str(target or '')
+                gold_answers.append(answer)
+            self_opd_tensors = build_self_opd_batch(
+                final_node_list,
+                self.tokenizer,
+                max_events=self.config.self_opd_max_events,
+                max_teacher_length=self.config.self_opd_max_teacher_length,
+                max_query_tokens=self.config.self_opd_max_query_tokens,
+                max_action_tokens=self.config.self_opd_max_action_tokens,
+                max_evidence_tokens=self.config.self_opd_max_evidence_tokens,
+                min_value_gap=self.config.self_opd_min_value_gap,
+                min_raw_advantage=self.config.self_opd_min_raw_advantage,
+                max_advantage_weight=self.config.self_opd_max_advantage_weight,
+                teacher_context=self.config.self_opd_teacher_context,
+                gold_answers=gold_answers,
+                event_selection=self.config.self_opd_event_selection,
+                analyzer_url=self.config.self_opd_analyzer_url,
+            )
+            for key, value in self_opd_tensors.items():
+                final_output.batch[key] = value.to(final_responses.device)
 
         # get meta info
         turns_stats = []

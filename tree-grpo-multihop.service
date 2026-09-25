@@ -1,0 +1,27 @@
+[Unit]
+Description=Multi-hop Tree-GRPO training
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/luwa/Documents/Tree-GRPO
+Environment=HOME=/home/luwa
+Environment=PYTHONUNBUFFERED=1
+Environment=EXPERIMENT_NAME=multihopqa-tree-grpo-sft350-3gpu-budget48-entropy0-systemd-20260821
+Environment=SAVE_FREQ=2
+Environment=TEST_FREQ=20
+Environment=VAL_BEFORE_TRAIN=false
+ExecStart=/home/luwa/Documents/Tree-GRPO/run_multihopqa_tree_systemd.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=180
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tree-grpo-multihop
+
+[Install]
+WantedBy=default.target

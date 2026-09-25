@@ -19,7 +19,12 @@ def dprint(*args, **kwargs):
 
 
 class TreeNode:
-    EXPAND_MODES = frozenset({'random', 'uncertainty_balanced', 'outcome_prior'})
+    EXPAND_MODES = frozenset({
+        'random',
+        'grouped_random',
+        'uncertainty_balanced',
+        'outcome_prior',
+    })
 
     def __init__(
         self,
@@ -380,7 +385,9 @@ class TreeNode:
         """Select expansion nodes from this root and its non-leaf descendants.
 
         ``random`` deliberately retains legacy ``random.choices`` sampling
-        with replacement.  ``uncertainty_balanced`` uses weighted sampling
+        with replacement. ``grouped_random`` chooses one candidate uniformly
+        and repeats it for the whole expansion budget, so its continuations
+        form one sibling group. ``uncertainty_balanced`` uses weighted sampling
         without replacement while enough candidates exist. ``outcome_prior``
         uses calibrated historical mixed-correctness rates and samples with
         replacement so several continuations can share a promising prefix.
@@ -468,6 +475,13 @@ class TreeNode:
             # Keep this exact legacy call so existing seeded runs retain the
             # same with-replacement behavior.
             result = random.choices(candidate_set, k=n)
+            fallback_with_replacement_count = 0
+        elif mode == 'grouped_random':
+            # Spend the entire expansion budget at one uniformly selected
+            # parent.  Duplicate references are intentional: generation_ts
+            # expands each list entry independently, producing one original
+            # continuation plus ``n`` alternative children from this parent.
+            result = [random.choice(candidate_set)] * n if n else []
             fallback_with_replacement_count = 0
         elif mode == 'uncertainty_balanced':
             result = self._weighted_sample_without_replacement(candidate_set, weights, n)

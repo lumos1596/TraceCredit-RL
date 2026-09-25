@@ -34,6 +34,22 @@ actor_rollout_ref:
     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
     grad_clip: 1.0
     state_masking: False
+    # Query-only on-policy self-distillation. Rollout-side tensors are built
+    # only for same-parent sibling sets with both successful and failed leaves.
+    self_opd_enabled: False
+    self_opd_coef: 0.0
+    self_opd_temperature: 1.0
+    # Event-level gate on mean teacher-minus-student target-query log-prob.
+    self_opd_min_directional_lift: 0.0
+    self_opd_think_coef: 0.2
+    self_opd_query_coef: 1.0
+    self_opd_loss: jsd
+    # sampled_nll uses a hard positive-lift gate followed by sigmoid(beta*delta).
+    self_opd_beta: 5.0
+    self_opd_delta_min: 0.0
+    # Remote privileged teacher (e.g. a 7B answer-conditioned server). Empty
+    # keeps the legacy local self-teacher forward.
+    self_opd_teacher_url: ''
     clip_ratio: 0.2
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
@@ -195,6 +211,22 @@ algorithm:
   branch_credit_normalization: sibling_std
   branch_credit_clip: 3.0
   branch_credit_no_sibling: zero
+  self_opd_max_events: 3
+  self_opd_max_teacher_length: 1024
+  self_opd_max_query_tokens: 64
+  self_opd_max_action_tokens: 256
+  self_opd_max_evidence_tokens: 128
+  self_opd_min_value_gap: 0.25
+  self_opd_min_raw_advantage: 0.0
+  self_opd_max_advantage_weight: 3.0
+  # Privileged block used by the OPD teacher: 'hindsight' (legacy retrieved
+  # evidence + sibling alternatives) or 'answer' (gold-answer cheat sheet).
+  self_opd_teacher_context: hindsight
+  # Required when teacher_context=node_skill. Frozen analyzer HTTP endpoint.
+  self_opd_analyzer_url: ''
+  # 'contrast' keeps the gated sibling-winner events; 'all' distills every
+  # query against the answer cheat sheet (the audited population).
+  self_opd_event_selection: contrast
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   use_kl_in_reward: False

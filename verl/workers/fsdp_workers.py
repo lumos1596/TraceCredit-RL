@@ -659,6 +659,11 @@ class ActorRolloutRefWorker(Worker):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        # Saving materializes the FSDP shards on CUDA.  Even after the shards
+        # are offloaded, the caching allocator can retain those blocks and
+        # leave too little addressable memory for vLLM's next sleep-mode
+        # wake-up.  Release the inactive cache before the following rollout.
+        torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path, del_local_after_load=False, load_optimizer=True,

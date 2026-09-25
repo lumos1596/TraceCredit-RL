@@ -16,8 +16,13 @@ Single Process Actor
 """
 
 import itertools
+import json
+import math
+import struct
+import urllib.request
 from typing import Iterable, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -32,6 +37,169 @@ from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
 __all__ = ['DataParallelPPOActor']
+
+_SELF_OPD_HTTP_TIMEOUT = 600.0
+
+
+def _fetch_remote_teacher_log_probs(url, temperature, rows):
+    """Query a remote privileged teacher for query-token log-probs.
+
+    ``rows`` is a list of ``(token_ids, query_positions)`` pairs where
+    ``query_positions`` are unpadded absolute positions whose logits predict
+    the following token.  Returns one ``(q, vocab)`` float32 array per row.
+
+    Wire format (both directions): 4-byte little-endian JSON-header length,
+    JSON header, then raw arrays.  The server applies ``temperature`` before
+    ``log_softmax`` so the result matches the local teacher path exactly.
+    """
+    header = {
+        'temperature': float(temperature),
+        'rows': [
+            {'len': len(ids), 'query_positions': [int(p) for p in positions]}
+            for ids, positions in rows
+        ],
+    }
+    header_bytes = json.dumps(header).encode('utf-8')
+    if rows:
+        ids_flat = np.concatenate(
+            [np.asarray(ids, dtype=np.int64) for ids, _ in rows]
+        )
+    else:
+        ids_flat = np.zeros(0, dtype=np.int64)
+    body = struct.pack('<I', len(header_bytes)) + header_bytes + ids_flat.tobytes()
+
+    request = urllib.request.Request(
+        url.rstrip('/') + '/score',
+        data=body,
+        headers={'Content-Type': 'application/octet-stream'},
+        method='POST',
+    )
+    with urllib.request.urlopen(request, timeout=_SELF_OPD_HTTP_TIMEOUT) as response:
+        raw = response.read()
+
+    (header_len,) = struct.unpack('<I', raw[:4])
+    response_header = json.loads(raw[4:4 + header_len])
+    vocab = int(response_header['vocab'])
+    dtype = np.dtype(response_header.get('dtype', 'float32'))
+    payload = np.frombuffer(raw, dtype=dtype, offset=4 + header_len)
+    results = []
+    cursor = 0
+    for row_length in response_header['row_lengths']:
+        count = int(row_length) * vocab
+        results.append(payload[cursor:cursor + count].reshape(int(row_length), vocab).copy())
+        cursor += count
+    if cursor != payload.size:
+        raise ValueError('remote teacher response length mismatch')
+    return results
+
+
+def _symmetric_jsd_components(student_logits, teacher_logits, temperature=1.0):
+    if temperature <= 0:
+        raise ValueError('Self-OPD temperature must be positive')
+    student_log_probs = torch.log_softmax(student_logits.float() / temperature, dim=-1)
+    teacher_log_probs = torch.log_softmax(
+        teacher_logits.detach().float() / temperature, dim=-1
+    )
+    mixture_log_probs = torch.logaddexp(student_log_probs, teacher_log_probs) - math.log(2.0)
+    student_probs = student_log_probs.exp()
+    teacher_probs = teacher_log_probs.exp()
+    student_kl = (student_probs * (student_log_probs - mixture_log_probs)).sum(dim=-1)
+    teacher_kl = (teacher_probs * (teacher_log_probs - mixture_log_probs)).sum(dim=-1)
+    jsd = 0.5 * (student_kl + teacher_kl) * (temperature ** 2)
+    return jsd, student_log_probs, teacher_log_probs
+
+
+def _symmetric_jsd_from_teacher_log_probs(student_logits, teacher_log_probs, temperature=1.0):
+    """Symmetric JSD against a remote teacher that already applied temperature."""
+    if temperature <= 0:
+        raise ValueError('Self-OPD temperature must be positive')
+    student_log_probs = torch.log_softmax(student_logits.float() / temperature, dim=-1)
+    teacher_log_probs = teacher_log_probs.detach().float()
+    mixture_log_probs = torch.logaddexp(student_log_probs, teacher_log_probs) - math.log(2.0)
+    student_probs = student_log_probs.exp()
+    teacher_probs = teacher_log_probs.exp()
+    student_kl = (student_probs * (student_log_probs - mixture_log_probs)).sum(dim=-1)
+    teacher_kl = (teacher_probs * (teacher_log_probs - mixture_log_probs)).sum(dim=-1)
+    jsd = 0.5 * (student_kl + teacher_kl) * (temperature ** 2)
+    return jsd, student_log_probs, teacher_log_probs
+
+
+def symmetric_jsd_from_logits(student_logits, teacher_logits, temperature=1.0):
+    """Per-token Jensen-Shannon divergence with a stop-gradient teacher."""
+    return _symmetric_jsd_components(student_logits, teacher_logits, temperature)[0]
+
+
+def _directional_event_gate(
+    student_target_log_probs,
+    teacher_target_log_probs,
+    token_mask,
+    event_mask,
+    min_lift=0.0,
+):
+    """Keep events whose teacher improves the complete target query on average.
+
+    The decision is detached: it selects supervision but must not create a
+    gradient incentive for the student to lower its own target likelihood.
+    """
+    token_mask_f = token_mask.float()
+    token_count = token_mask_f.sum(dim=-1)
+    mean_lift = (
+        ((teacher_target_log_probs - student_target_log_probs).detach() * token_mask_f)
+        .sum(dim=-1)
+        / token_count.clamp_min(1.0)
+    )
+    return event_mask & (token_count > 0) & (mean_lift > float(min_lift)), mean_lift
+
+
+def _opd_span_weights(think_mask, query_mask, think_coef, query_coef):
+    """Normalize think and query spans independently inside each event."""
+    think = think_mask.float()
+    query = query_mask.float()
+    think = think * (float(think_coef) / think.sum(dim=-1, keepdim=True).clamp_min(1.0))
+    query = query * (float(query_coef) / query.sum(dim=-1, keepdim=True).clamp_min(1.0))
+    return think + query
+
+
+def sampled_nll_opd_components(
+    student_target_log_probs,
+    skill_target_log_probs,
+    token_mask,
+    think_mask,
+    query_mask,
+    event_mask,
+    event_advantage,
+    *,
+    beta=5.0,
+    delta_min=0.0,
+    think_coef=0.2,
+    query_coef=1.0,
+):
+    """Return the weighted sampled-NLL numerator and detached weights.
+
+    Both the skill-induced lift and all gates are deliberately detached.  The
+    only gradient path is therefore through the ordinary-context likelihood of
+    the exact on-policy tokens that were sampled during rollout.
+    """
+    if float(beta) <= 0:
+        raise ValueError('self_opd_beta must be positive')
+    if not math.isfinite(float(delta_min)):
+        raise ValueError('self_opd_delta_min must be finite')
+    delta = (skill_target_log_probs - student_target_log_probs).detach()
+    advantage = event_advantage.detach().clamp_min(0.0).unsqueeze(-1)
+    valid = token_mask.bool() & event_mask.bool().unsqueeze(-1)
+    positive_lift = delta > float(delta_min)
+    span_weights = _opd_span_weights(
+        think_mask, query_mask, think_coef, query_coef
+    )
+    weights = (
+        valid.float()
+        * positive_lift.float()
+        * advantage
+        * torch.sigmoid(float(beta) * delta)
+        * span_weights
+    ).detach()
+    numerator = -(student_target_log_probs * weights).sum()
+    return numerator, weights, delta
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -52,8 +220,52 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+        if self.config.get('self_opd_enabled', False):
+            if self.config.get('self_opd_loss', 'jsd') not in ('jsd', 'sampled_nll'):
+                raise ValueError('self_opd_loss must be jsd or sampled_nll')
+            if float(self.config.get('self_opd_coef', 0.0)) < 0:
+                raise ValueError('self_opd_coef must be non-negative')
+            if float(self.config.get('self_opd_temperature', 1.0)) <= 0:
+                raise ValueError('self_opd_temperature must be positive')
+            if not math.isfinite(float(self.config.get('self_opd_min_directional_lift', 0.0))):
+                raise ValueError('self_opd_min_directional_lift must be finite')
+            if float(self.config.get('self_opd_think_coef', 0.2)) < 0:
+                raise ValueError('self_opd_think_coef must be non-negative')
+            if float(self.config.get('self_opd_query_coef', 1.0)) <= 0:
+                raise ValueError('self_opd_query_coef must be positive')
+            if float(self.config.get('self_opd_beta', 5.0)) <= 0:
+                raise ValueError('self_opd_beta must be positive')
+            if not math.isfinite(float(self.config.get('self_opd_delta_min', 0.0))):
+                raise ValueError('self_opd_delta_min must be finite')
+        self.self_opd_teacher_url = str(self.config.get('self_opd_teacher_url', '') or '')
+        if self.self_opd_teacher_url and not self.self_opd_teacher_url.startswith('http'):
+            raise ValueError('self_opd_teacher_url must be an http(s) URL')
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _entropy_from_logits_chunked(logits: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        """Compute exact categorical entropy without retaining an autograd graph.
+
+        Chunking over token rows bounds the temporary full-vocabulary softmax
+        tensors.  This is intended for monitoring when entropy_coeff is zero.
+        """
+        if chunk_size <= 0:
+            raise ValueError('entropy_token_chunk_size must be positive')
+        output_shape = logits.shape[:-1]
+        flat_logits = logits.detach().reshape(-1, logits.size(-1))
+        with torch.no_grad():
+            entropy_chunks = [
+                verl_F.entropy_from_logits(chunk)
+                for chunk in flat_logits.split(chunk_size, dim=0)
+            ]
+            return torch.cat(entropy_chunks, dim=0).reshape(output_shape)
+
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        entropy_requires_grad=True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -123,7 +335,13 @@ class DataParallelPPOActor(BasePPOActor):
                 # tensor and can consume several GiB for long agent traces.
                 entropy_rmpad = None
                 if calculate_entropy:
-                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                    if entropy_requires_grad:
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                    else:
+                        entropy_rmpad = self._entropy_from_logits_chunked(
+                            logits_rmpad,
+                            int(self.config.get('entropy_token_chunk_size', 16)),
+                        )
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -177,7 +395,13 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                 if calculate_entropy:
-                    entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                    if entropy_requires_grad:
+                        entropy = verl_F.entropy_from_logits(logits)
+                    else:
+                        entropy = self._entropy_from_logits_chunked(
+                            logits,
+                            int(self.config.get('entropy_token_chunk_size', 16)),
+                        )
 
             return entropy, log_probs
 
@@ -247,6 +471,257 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def _compute_self_opd_loss(self, data, normalization_weight=None):
+        """Compute query-only JSD for one actor micro-batch.
+
+        Two fixed-count forwards are issued per sample (one teacher, one
+        student).  Keeping the call count independent of valid event count is
+        important for FSDP ranks whose local rollouts contain different
+        numbers of contrastive sibling groups.
+        """
+        teacher_ids = data['self_opd_teacher_input_ids']
+        teacher_attention = data['self_opd_teacher_attention_mask'].bool()
+        teacher_positions = data['self_opd_teacher_query_positions']
+        student_positions = data['self_opd_student_query_positions']
+        token_mask = data['self_opd_token_mask'].bool()
+        think_mask = data['self_opd_think_mask'].bool()
+        query_mask = data['self_opd_query_mask'].bool()
+        event_mask = data['self_opd_event_mask'].bool()
+        input_ids = data['input_ids']
+        attention_mask = data['attention_mask']
+        position_ids = data['position_ids']
+        response_length = data['responses'].size(-1)
+        response_start = input_ids.size(-1) - response_length
+        temperature = float(self.config.get('self_opd_temperature', 1.0))
+        device_type = input_ids.device.type
+        autocast_enabled = device_type == 'cuda'
+
+        batch_size, max_events, teacher_length = teacher_ids.shape
+        max_action_tokens = student_positions.size(-1)
+        if teacher_length <= max_action_tokens + 1:
+            raise ValueError('Self-OPD teacher length must exceed max action tokens + 1')
+        # Selected think/query positions are separated by control tags. Reserve
+        # a small tag window in addition to the selected action-token budget.
+        teacher_window_tokens = min(teacher_length, max_action_tokens + 64)
+        teacher_keep_start = teacher_length - teacher_window_tokens
+        teacher_keep = torch.arange(
+            teacher_keep_start,
+            teacher_length - 1,
+            device=teacher_ids.device,
+            dtype=torch.long,
+        )
+
+        total_loss = input_ids.new_zeros((), dtype=torch.float32)
+        total_weight = input_ids.new_zeros((), dtype=torch.float32)
+        valid_events = input_ids.new_zeros((), dtype=torch.float32)
+        directional_stats = input_ids.new_zeros((4,), dtype=torch.float32)
+        for sample_index in range(batch_size):
+            sample_teacher_ids = teacher_ids[sample_index].clone()
+            sample_teacher_attention = teacher_attention[sample_index].clone()
+            invalid_events = ~event_mask[sample_index]
+            if invalid_events.any():
+                # Avoid an all-masked attention row on placeholder events.
+                sample_teacher_attention[invalid_events, -2:] = True
+                sample_teacher_ids[invalid_events, -2:] = 0
+
+            teacher_query_log_probs = None
+            if self.self_opd_teacher_url:
+                # Remote privileged teacher: ship each valid event's unpadded
+                # context plus the query's absolute positions; the server
+                # returns temperature-applied log-probs at those positions.
+                rows = []
+                row_events = []
+                for event_index in range(max_events):
+                    if not bool(event_mask[sample_index, event_index]):
+                        continue
+                    event_attention = sample_teacher_attention[event_index]
+                    event_ids = sample_teacher_ids[event_index][event_attention]
+                    sequence_length = int(event_ids.numel())
+                    pad_offset = teacher_length - sequence_length
+                    event_positions = teacher_positions[sample_index, event_index]
+                    rel_positions = (
+                        event_positions[token_mask[sample_index, event_index]] - pad_offset
+                    )
+                    if rel_positions.numel():
+                        if int(rel_positions.min()) < 0 or int(rel_positions.max()) >= sequence_length:
+                            raise ValueError('Self-OPD remote teacher query position is out of bounds')
+                    rows.append((event_ids.tolist(), rel_positions.tolist()))
+                    row_events.append(event_index)
+                remote_rows = _fetch_remote_teacher_log_probs(
+                    self.self_opd_teacher_url, temperature, rows
+                )
+                if remote_rows:
+                    vocab_size = int(remote_rows[0].shape[1])
+                    teacher_query_log_probs = input_ids.new_zeros(
+                        (max_events, max_action_tokens, vocab_size), dtype=torch.float32
+                    )
+                    for event_index, row in zip(row_events, remote_rows):
+                        teacher_query_log_probs[event_index, :row.shape[0]] = (
+                            torch.from_numpy(row).to(teacher_query_log_probs.device)
+                        )
+            else:
+                sample_teacher_position_ids = (
+                    sample_teacher_attention.long().cumsum(dim=-1) - 1
+                ).clamp_min(0) * sample_teacher_attention.long()
+
+                with torch.no_grad(), torch.autocast(
+                    device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+                ):
+                    teacher_output = self.actor_module(
+                        input_ids=sample_teacher_ids,
+                        attention_mask=sample_teacher_attention,
+                        position_ids=sample_teacher_position_ids,
+                        use_cache=False,
+                        logits_to_keep=teacher_keep,
+                    )
+                    teacher_window_logits = teacher_output.logits
+
+            response_positions = student_positions[sample_index]
+            student_logit_positions = response_start + response_positions - 1
+            safe_student_positions = torch.where(
+                token_mask[sample_index],
+                student_logit_positions,
+                torch.zeros_like(student_logit_positions),
+            ).reshape(-1)
+            if token_mask[sample_index].any():
+                valid_student = student_logit_positions[token_mask[sample_index]]
+                if valid_student.min() < 0 or valid_student.max() >= input_ids.size(-1):
+                    raise ValueError('Self-OPD student query position is out of bounds')
+
+            # The student forward always runs: FSDP ranks must issue the same
+            # number of actor forwards per micro-batch regardless of how many
+            # sibling-group events each rank's rollouts happened to produce.
+            sample_position_ids = position_ids[sample_index:sample_index + 1]
+            with torch.autocast(
+                device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+            ):
+                student_output = self.actor_module(
+                    input_ids=input_ids[sample_index:sample_index + 1],
+                    attention_mask=attention_mask[sample_index:sample_index + 1],
+                    position_ids=sample_position_ids,
+                    use_cache=False,
+                    logits_to_keep=safe_student_positions,
+                )
+                student_logits = student_output.logits.reshape(
+                    max_events, max_action_tokens, -1
+                )
+
+            if self.self_opd_teacher_url:
+                if teacher_query_log_probs is None:
+                    # No valid events on this sample: every OPD term is
+                    # zero-weighted.  Keep the loss graph connected so the
+                    # coefficient-weighted backward below stays valid.
+                    total_loss = total_loss + student_logits.sum() * 0.0
+                    continue
+                per_token_jsd, student_log_probs, teacher_log_probs = (
+                    _symmetric_jsd_from_teacher_log_probs(
+                        student_logits, teacher_query_log_probs, temperature=temperature
+                    )
+                )
+            else:
+                teacher_offsets = teacher_positions[sample_index] - teacher_keep_start
+                safe_teacher_offsets = torch.where(
+                    token_mask[sample_index],
+                    teacher_offsets,
+                    torch.zeros_like(teacher_offsets),
+                )
+                if token_mask[sample_index].any():
+                    valid_teacher = teacher_offsets[token_mask[sample_index]]
+                    if valid_teacher.min() < 0 or valid_teacher.max() >= teacher_window_logits.size(1):
+                        raise ValueError('Self-OPD teacher query position is out of bounds')
+                gather_index = safe_teacher_offsets.unsqueeze(-1).expand(
+                    -1, -1, teacher_window_logits.size(-1)
+                )
+                aligned_teacher_logits = teacher_window_logits.gather(1, gather_index)
+                per_token_jsd, student_log_probs, teacher_log_probs = _symmetric_jsd_components(
+                    student_logits, aligned_teacher_logits, temperature=temperature
+                )
+            # Score exactly the target query tokens under both contexts.  This
+            # also supplies a detached event gate: never distill an event when
+            # privileged context makes the teacher worse on the complete query.
+            target_input_positions = response_start + response_positions
+            safe_target_positions = torch.where(
+                token_mask[sample_index],
+                target_input_positions,
+                torch.zeros_like(target_input_positions),
+            ).reshape(-1)
+            target_ids = input_ids[sample_index].gather(0, safe_target_positions).reshape(
+                max_events, max_action_tokens
+            )
+            student_target_log_probs = student_log_probs.gather(
+                -1, target_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            teacher_target_log_probs = teacher_log_probs.gather(
+                -1, target_ids.unsqueeze(-1)
+            ).squeeze(-1).detach()
+            loss_mode = self.config.get('self_opd_loss', 'jsd')
+            if loss_mode == 'sampled_nll':
+                sampled_nll, weights, _ = sampled_nll_opd_components(
+                    student_target_log_probs,
+                    teacher_target_log_probs,
+                    token_mask[sample_index],
+                    think_mask[sample_index],
+                    query_mask[sample_index],
+                    event_mask[sample_index],
+                    data['self_opd_event_weight'][sample_index],
+                    beta=self.config.get('self_opd_beta', 5.0),
+                    delta_min=self.config.get('self_opd_delta_min', 0.0),
+                    think_coef=self.config.get('self_opd_think_coef', 0.2),
+                    query_coef=self.config.get('self_opd_query_coef', 1.0),
+                )
+                gated_events = weights.sum(dim=-1) > 0
+                total_loss = total_loss + sampled_nll
+            else:
+                gated_events, _ = _directional_event_gate(
+                    student_target_log_probs,
+                    teacher_target_log_probs,
+                    token_mask[sample_index],
+                    event_mask[sample_index],
+                    self.config.get('self_opd_min_directional_lift', 0.0),
+                )
+                span_weights = _opd_span_weights(
+                    think_mask[sample_index],
+                    query_mask[sample_index],
+                    self.config.get('self_opd_think_coef', 0.2),
+                    self.config.get('self_opd_query_coef', 1.0),
+                )
+                weights = span_weights * gated_events.unsqueeze(-1).float()
+                total_loss = total_loss + (per_token_jsd * weights).sum()
+            total_weight = total_weight + weights.sum()
+            valid_events = valid_events + gated_events.sum()
+
+            directional_mask = (
+                token_mask[sample_index].float()
+                * event_mask[sample_index].unsqueeze(-1).float()
+            )
+            lift = teacher_target_log_probs - student_target_log_probs
+            directional_stats[0] += (student_target_log_probs.detach() * directional_mask).sum()
+            directional_stats[1] += (teacher_target_log_probs * directional_mask).sum()
+            directional_stats[2] += ((lift > 0).float() * directional_mask).sum()
+            directional_stats[3] += directional_mask.sum()
+
+        if self.config.get('self_opd_loss', 'jsd') == 'sampled_nll':
+            # The sampled-NLL denominator depends on the online delta gate and
+            # is not known until after both forwards.  Match FSDP's gradient
+            # averaging by dividing each rank by global_weight/world_size.
+            denominator = total_weight.detach().clone()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(denominator, op=torch.distributed.ReduceOp.SUM)
+                denominator /= torch.distributed.get_world_size()
+        else:
+            denominator = (
+                normalization_weight.to(total_loss.device)
+                if normalization_weight is not None
+                else total_weight
+            )
+        loss = total_loss / denominator.clamp_min(1.0)
+        return (
+            loss,
+            total_weight.detach(),
+            valid_events.detach(),
+            directional_stats.detach(),
+        )
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -262,6 +737,24 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if self.config.policy_loss == 'turn':
             select_keys.append('turns_mask')
+        if self.config.get('self_opd_enabled', False):
+            select_keys.extend([
+                'self_opd_teacher_input_ids',
+                'self_opd_teacher_attention_mask',
+                'self_opd_teacher_query_positions',
+                'self_opd_student_query_positions',
+                'self_opd_token_mask',
+                'self_opd_think_mask',
+                'self_opd_query_mask',
+                'self_opd_event_mask',
+                'self_opd_event_weight',
+                'self_opd_raw_advantage',
+                'self_opd_value_gap',
+                'self_opd_target_value',
+                'self_opd_sibling_count',
+                'self_opd_context_truncated',
+                'self_opd_prompt_retained_fraction',
+            ])
         batch = data.select(batch_keys=select_keys).batch
 
         # Split to make minibatch iterator for updating the actor
@@ -269,9 +762,73 @@ class DataParallelPPOActor(BasePPOActor):
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        # Slots 0-14: rollout/event diagnostics. Slot 15 accumulates the raw
+        # self_opd_loss so it can be all-reduced: DataProto.concat keeps only
+        # rank 0's meta_info, so a local metric would hide events that ran on
+        # other ranks.  After the reduce, loss/world_size is the global
+        # token-mean JSD.
+        self_opd_update_stats = [0.0] * 20
         for batch_idx, data in enumerate(dataloader):
             # split batch into micro_batches
             mini_batch = data
+            self_opd_normalization_weight = None
+            if self.config.get('self_opd_enabled', False):
+                valid_event_mask = mini_batch['self_opd_event_mask'].bool()
+                valid_token_mask = mini_batch['self_opd_token_mask'].bool()
+                valid_think_mask = mini_batch['self_opd_think_mask'].bool()
+                valid_query_mask = mini_batch['self_opd_query_mask'].bool()
+                effective_token_mask = (
+                    _opd_span_weights(
+                        valid_think_mask,
+                        valid_query_mask,
+                        self.config.get('self_opd_think_coef', 0.2),
+                        self.config.get('self_opd_query_coef', 1.0),
+                    ) * valid_event_mask.unsqueeze(-1).float()
+                )
+                local_weight = effective_token_mask.sum()
+                # FSDP averages gradients across ranks. Dividing each rank's
+                # numerator by global_weight/world_size therefore produces a
+                # true global token mean after gradient reduction.
+                # all_reduce is in-place; clone so the local diagnostic is not
+                # silently overwritten with the cross-rank total.
+                self_opd_normalization_weight = local_weight.detach().clone().cuda()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(
+                        self_opd_normalization_weight,
+                        op=torch.distributed.ReduceOp.SUM,
+                    )
+                    self_opd_normalization_weight /= torch.distributed.get_world_size()
+
+                event_mask_float = valid_event_mask.float()
+                self_opd_update_stats[0] += valid_event_mask.sum().item()
+                self_opd_update_stats[1] += effective_token_mask.sum().item()
+                self_opd_update_stats[2] += local_weight.item()
+                self_opd_update_stats[3] += valid_event_mask.any(dim=-1).sum().item()
+                self_opd_update_stats[4] += valid_event_mask.size(0)
+                self_opd_update_stats[5] += (
+                    mini_batch['self_opd_context_truncated'].bool() & valid_event_mask
+                ).sum().item()
+                self_opd_update_stats[6] += (
+                    mini_batch['self_opd_prompt_retained_fraction'].float() * event_mask_float
+                ).sum().item()
+                self_opd_update_stats[7] += (
+                    mini_batch['self_opd_raw_advantage'].float() * event_mask_float
+                ).sum().item()
+                self_opd_update_stats[8] += (
+                    mini_batch['self_opd_value_gap'].float() * event_mask_float
+                ).sum().item()
+                self_opd_update_stats[9] += (
+                    mini_batch['self_opd_target_value'].float() * event_mask_float
+                ).sum().item()
+                self_opd_update_stats[10] += (
+                    mini_batch['self_opd_sibling_count'].float() * event_mask_float
+                ).sum().item()
+                self_opd_update_stats[18] += (
+                    valid_think_mask & valid_event_mask.unsqueeze(-1)
+                ).sum().item()
+                self_opd_update_stats[19] += (
+                    valid_query_mask & valid_event_mask.unsqueeze(-1)
+                ).sum().item()
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                 micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
@@ -306,16 +863,18 @@ class DataParallelPPOActor(BasePPOActor):
                 loss_agg_mode = self.config.loss_agg_mode
 
                 # all return: (bsz, response_length)
-                # A zero entropy coefficient is common for GRPO. Avoid building
-                # the full-vocabulary entropy tensor in that case: for long
-                # agent/search traces it can require more than 1 GiB even with
-                # a per-GPU micro batch of one, while contributing exactly zero
-                # to the policy loss.
-                calculate_entropy = entropy_coeff != 0
+                # Entropy can be monitored independently of the entropy bonus.
+                # Computing it is opt-in because the full-vocabulary tensor is
+                # expensive for long agent/search traces.
+                calculate_entropy = (
+                    entropy_coeff != 0
+                    or self.config.get('log_policy_entropy', False)
+                )
                 entropy, log_prob = self._forward_micro_batch(
                     micro_batch=data,
                     temperature=temperature,
                     calculate_entropy=calculate_entropy,
+                    entropy_requires_grad=entropy_coeff != 0,
                 )
 
                 if self.config.policy_loss == 'gspo':
@@ -372,14 +931,41 @@ class DataParallelPPOActor(BasePPOActor):
                     kl_loss = masked_mean(kld, response_mask)
 
                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                    metrics['actor/kl_loss'] = kl_loss.detach().item()
-                    metrics['actor/kl_coef'] = self.config.kl_loss_coef
+                    # Keep every micro-batch value so reduce_metrics reports the
+                    # update-wide mean rather than only the final micro-batch.
+                    append_to_dict(metrics, {
+                        'actor/kl_loss': kl_loss.detach().item(),
+                        'actor/ref_kl': kl_loss.detach().item(),
+                        'actor/kl_coef': self.config.kl_loss_coef,
+                    })
 
                 loss = policy_loss / self.gradient_accumulation
                 loss.backward()
 
+                # Use a separate forward/backward pair for Self-OPD.  This
+                # avoids retaining the PPO graph across additional FSDP
+                # forwards and substantially lowers peak activation memory.
+                if self.config.get('self_opd_enabled', False):
+                    (
+                        self_opd_loss,
+                        self_opd_token_weight,
+                        self_opd_events,
+                        self_opd_directional_stats,
+                    ) = self._compute_self_opd_loss(
+                        data,
+                        normalization_weight=self_opd_normalization_weight,
+                    )
+                    self_opd_coef = float(self.config.get('self_opd_coef', 0.0))
+                    (self_opd_coef * self_opd_loss).backward()
+                    self_opd_update_stats[15] += self_opd_loss.detach().item()
+                    self_opd_update_stats[16] += self_opd_events.item()
+                    self_opd_update_stats[17] += self_opd_token_weight.item()
+                    for stat_index, value in enumerate(self_opd_directional_stats):
+                        self_opd_update_stats[11 + stat_index] += value.item()
+
                 data = {
                     'actor/entropy_loss': entropy_loss.detach().item(),
+                    'actor/policy_entropy': entropy_loss.detach().item(),
                     'actor/pg_loss': pg_loss.detach().item(),
                     'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                     'actor/ppo_kl': ppo_kl.detach().item(),
@@ -389,5 +975,57 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self._optimizer_step()
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
+        if self.config.get('self_opd_enabled', False):
+            diagnostic_totals = torch.tensor(
+                self_opd_update_stats,
+                dtype=torch.float64,
+                device=torch.device('cuda', torch.cuda.current_device()),
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(diagnostic_totals, op=torch.distributed.ReduceOp.SUM)
+            event_total = diagnostic_totals[0].clamp_min(1.0)
+            sample_total = diagnostic_totals[4].clamp_min(1.0)
+            directional_token_total = diagnostic_totals[14].clamp_min(1.0)
+            # FSDP averages gradients across ranks, so the effective loss is
+            # sum_r(loss_r) / world_size; report that global token-mean.
+            world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized() else 1
+            )
+            append_to_dict(metrics, {
+                'self_opd/loss': (diagnostic_totals[15] / world_size).item(),
+                'self_opd/coef': float(self.config.get('self_opd_coef', 0.0)),
+                'self_opd/events_per_update': diagnostic_totals[0].item(),
+                'self_opd/query_tokens_per_update': diagnostic_totals[1].item(),
+                'self_opd/weighted_tokens_per_update': diagnostic_totals[2].item(),
+                'self_opd/sample_coverage': (diagnostic_totals[3] / sample_total).item(),
+                'self_opd/context_truncated_fraction': (
+                    diagnostic_totals[5] / event_total
+                ).item(),
+                'self_opd/prompt_retained_fraction': (
+                    diagnostic_totals[6] / event_total
+                ).item(),
+                'self_opd/raw_advantage_mean': (diagnostic_totals[7] / event_total).item(),
+                'self_opd/value_gap_mean': (diagnostic_totals[8] / event_total).item(),
+                'self_opd/target_value_mean': (diagnostic_totals[9] / event_total).item(),
+                'self_opd/sibling_count_mean': (diagnostic_totals[10] / event_total).item(),
+                'self_opd/student_target_logprob_mean': (
+                    diagnostic_totals[11] / directional_token_total
+                ).item(),
+                'self_opd/teacher_target_logprob_mean': (
+                    diagnostic_totals[12] / directional_token_total
+                ).item(),
+                'self_opd/target_logprob_lift': (
+                    (diagnostic_totals[12] - diagnostic_totals[11])
+                    / directional_token_total
+                ).item(),
+                'self_opd/teacher_positive_token_fraction': (
+                    diagnostic_totals[13] / directional_token_total
+                ).item(),
+                'self_opd/gated_events_per_update': diagnostic_totals[16].item(),
+                'self_opd/gated_query_tokens_per_update': diagnostic_totals[17].item(),
+                'self_opd/think_tokens_per_update': diagnostic_totals[18].item(),
+                'self_opd/search_tokens_per_update': diagnostic_totals[19].item(),
+            })
         self.actor_optimizer.zero_grad()
         return metrics

@@ -76,6 +76,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
+            # Checkpointing and actor updates may leave inactive CUDA cache
+            # blocks behind.  vLLM sleep mode remaps its weight/KV allocations
+            # during wake_up(), so release those blocks before requesting the
+            # mappings rather than after they have already failed.
+            torch.cuda.empty_cache()
             self.inference_engine.wake_up()
             # TODO(ZSL): deal with 'hf' format
             if load_format == 'dtensor':

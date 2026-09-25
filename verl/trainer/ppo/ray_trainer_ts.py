@@ -1306,6 +1306,37 @@ class RayPPOTrainer(object):
             branch_credit_correctness_threshold=float(self.config.algorithm.get(
                 'branch_credit_correctness_threshold', 0.8
             )),
+            enable_self_opd=bool(self.config.actor_rollout_ref.actor.get(
+                'self_opd_enabled', False
+            )),
+            self_opd_max_events=int(self.config.algorithm.get('self_opd_max_events', 3)),
+            self_opd_max_teacher_length=int(self.config.algorithm.get(
+                'self_opd_max_teacher_length', 1024
+            )),
+            self_opd_max_query_tokens=int(self.config.algorithm.get(
+                'self_opd_max_query_tokens', 64
+            )),
+            self_opd_max_evidence_tokens=int(self.config.algorithm.get(
+                'self_opd_max_evidence_tokens', 128
+            )),
+            self_opd_min_value_gap=float(self.config.algorithm.get(
+                'self_opd_min_value_gap', 0.25
+            )),
+            self_opd_min_raw_advantage=float(self.config.algorithm.get(
+                'self_opd_min_raw_advantage', 0.0
+            )),
+            self_opd_max_advantage_weight=float(self.config.algorithm.get(
+                'self_opd_max_advantage_weight', 3.0
+            )),
+            self_opd_teacher_context=str(self.config.algorithm.get(
+                'self_opd_teacher_context', 'hindsight'
+            )),
+            self_opd_event_selection=str(self.config.algorithm.get(
+                'self_opd_event_selection', 'contrast'
+            )),
+            self_opd_analyzer_url=str(self.config.algorithm.get(
+                'self_opd_analyzer_url', ''
+            )),
         )
         generation_manager = LLMGenerationTreeSearchManager(
             tokenizer=self.tokenizer,
@@ -1446,7 +1477,9 @@ class RayPPOTrainer(object):
                 batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                 for key in batch.batch.keys():
-                    if key not in {'old_log_probs', 'token_level_scores'} and not key.startswith('branch_'):
+                    if (key not in {'old_log_probs', 'token_level_scores'}
+                            and not key.startswith('branch_')
+                            and not key.startswith('self_opd_')):
                         batch.batch[key] = batch.batch[key].long()
 
                 if self.use_reference_policy:
@@ -1630,6 +1663,37 @@ class RayPPOTrainer(object):
             branch_credit_correctness_threshold=float(self.config.algorithm.get(
                 'branch_credit_correctness_threshold', 0.8
             )),
+            enable_self_opd=bool(self.config.actor_rollout_ref.actor.get(
+                'self_opd_enabled', False
+            )),
+            self_opd_max_events=int(self.config.algorithm.get('self_opd_max_events', 3)),
+            self_opd_max_teacher_length=int(self.config.algorithm.get(
+                'self_opd_max_teacher_length', 1024
+            )),
+            self_opd_max_query_tokens=int(self.config.algorithm.get(
+                'self_opd_max_query_tokens', 64
+            )),
+            self_opd_max_evidence_tokens=int(self.config.algorithm.get(
+                'self_opd_max_evidence_tokens', 128
+            )),
+            self_opd_min_value_gap=float(self.config.algorithm.get(
+                'self_opd_min_value_gap', 0.25
+            )),
+            self_opd_min_raw_advantage=float(self.config.algorithm.get(
+                'self_opd_min_raw_advantage', 0.0
+            )),
+            self_opd_max_advantage_weight=float(self.config.algorithm.get(
+                'self_opd_max_advantage_weight', 3.0
+            )),
+            self_opd_teacher_context=str(self.config.algorithm.get(
+                'self_opd_teacher_context', 'hindsight'
+            )),
+            self_opd_event_selection=str(self.config.algorithm.get(
+                'self_opd_event_selection', 'contrast'
+            )),
+            self_opd_analyzer_url=str(self.config.algorithm.get(
+                'self_opd_analyzer_url', ''
+            )),
         )
 
         generation_manager = LLMGenerationTreeSearchManager(
@@ -1689,7 +1753,9 @@ class RayPPOTrainer(object):
 
                         # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
                         for key in final_gen_batch_output.batch.keys():
-                            if key != 'token_level_scores' and not key.startswith('branch_'):
+                            if (key != 'token_level_scores'
+                                    and not key.startswith('branch_')
+                                    and not key.startswith('self_opd_')):
                                 final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
                         with torch.no_grad():
@@ -1717,7 +1783,9 @@ class RayPPOTrainer(object):
 
                     # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
                     for key in batch.batch.keys():
-                        if key not in {'old_log_probs', 'token_level_scores'} and not key.startswith('branch_'):
+                        if (key not in {'old_log_probs', 'token_level_scores'}
+                                and not key.startswith('branch_')
+                                and not key.startswith('self_opd_')):
                             batch.batch[key] = batch.batch[key].long()
 
                     if self.use_reference_policy:
