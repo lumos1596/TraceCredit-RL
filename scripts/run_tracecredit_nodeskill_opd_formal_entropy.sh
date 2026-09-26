@@ -47,6 +47,11 @@ export ROLLOUT_MAX_NUM_SEQS=32
 export DAPO_TARGET_EFFECTIVE_PROMPTS=12
 export DAPO_MAX_CHUNKS=24
 export ROLLOUT_ACCUMULATION_STEPS=8
-export RETRIEVER_URL=http://127.0.0.1:8000/retrieve
+# Services (retriever :8000, node-skill analyzer :8127) run on the service host.
+# Defaults target the service host itself; on a training-only machine, export
+# RETRIEVER_URL / SELF_OPD_ANALYZER_URL pointing at the service host's LAN IP
+# (see README "Cross-machine handoff").
+export RETRIEVER_URL=${RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}
+export SELF_OPD_ANALYZER_URL=${SELF_OPD_ANALYZER_URL:-http://127.0.0.1:8127}
 
 exec "$ROOT/train_multihopqa_branch_credit_dapo_step20_to30.sh"

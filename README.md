@@ -290,10 +290,18 @@ mkdir -p verl_checkpoints
 mv singlehopqa-sft-search-r1-qwen2.5-3b-instruct verl_checkpoints/
 mv tracecredit-nodeskill-sampled-nll-opd-formal-entropy-chunked-retry-20260925 verl_checkpoints/
 
-# 4. Public resources (not in the HF repo; fetch from official sources)
-#    Teacher:  Qwen/Qwen2.5-7B-Instruct          -> models/Qwen2.5-7B-Instruct (GPU 0, port 8126)
-#    Retriever: intfloat/e5-base-v2 + flashRAG wiki-18 corpus + e5 Flat index (:8000)
-#    Env:      rebuild .conda/envs/treegrpo from pyproject.toml / requirements.txt
+# 4. Services run on the service host (this machine, LAN IP 172.18.167.248)
+#    - Retriever (e5 + wiki-18 FAISS index):  http://172.18.167.248:8000/retrieve
+#    - Node-skill analyzer (3B, GPU 0):       http://172.18.167.248:8127
+#    On a training-only machine, export before launching:
+#      export RETRIEVER_URL=http://172.18.167.248:8000/retrieve
+#      export SELF_OPD_ANALYZER_URL=http://172.18.167.248:8127
+#    Off-LAN, tunnel instead:
+#      ssh -L 8000:127.0.0.1:8000 -L 8127:127.0.0.1:8127 <service-host>
+#    Both services auto-start with the run scripts; defaults point to 127.0.0.1,
+#    which is correct on the service host itself.
+#    Teacher (dense answer-OPD runs only): Qwen/Qwen2.5-7B-Instruct from official HF
+#    Env: rebuild .conda/envs/treegrpo from pyproject.toml / requirements.txt
 
 # 5. Resume (auto-detects the latest complete checkpoint)
 bash scripts/run_tracecredit_nodeskill_opd_formal_entropy.sh

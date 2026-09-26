@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=${PROJECT_DIR:-/home/luwa/Documents/Tree-GRPO}
 PYTHON="$ROOT/.conda/envs/treegrpo/bin/python"
 RETRIEVER_URL=${RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}
+ANALYZER_URL=${SELF_OPD_ANALYZER_URL:-http://127.0.0.1:8127}
 
 for path in \
     "$PYTHON" \
@@ -14,7 +15,7 @@ for path in \
     [[ -s "$path" ]] || exit 1
 done
 
-analyzer_health=$(curl -fsS --max-time 5 http://127.0.0.1:8127/health 2>/dev/null) || exit 1
+analyzer_health=$(curl -fsS --max-time 5 "$ANALYZER_URL/health" 2>/dev/null) || exit 1
 printf '%s' "$analyzer_health" \
     | "$PYTHON" -c 'import json,sys; assert json.load(sys.stdin).get("ok") is True' >/dev/null
 retriever_health=$(curl -fsS --max-time 10 -H 'Content-Type: application/json' \
