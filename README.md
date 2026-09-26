@@ -263,6 +263,42 @@ and evaluation set identical. This is the valid test of whether local credit is
 overweighted; changing model scale or rollout budget at the same time would
 confound the result.
 
+## Cross-machine handoff (RL+OPD checkpoints)
+
+Large artifacts are hosted on Hugging Face:
+[`lumos2548/treegrpo-rl-opd-handoff`](https://huggingface.co/datasets/lumos2548/treegrpo-rl-opd-handoff)
+
+| Artifact | Path in the HF repo | Size |
+|---|---|---|
+| Student SFT init | `singlehopqa-sft-search-r1-qwen2.5-3b-instruct/global_step_350/` | ~36 GB |
+| RL+OPD latest checkpoint | `tracecredit-nodeskill-sampled-nll-opd-formal-entropy-chunked-retry-20260925/actor/global_step_9/` | ~36 GB |
+| Training/eval data | `data/multihopqa_search_mixed_402020_20260830/` | ~1 GB |
+
+To resume on a new machine (scripts hard-code `/home/luwa/Documents/Tree-GRPO`,
+so use the same path or adjust `PROJECT_DIR`):
+
+```bash
+# 1. Code
+git clone https://github.com/lumos1596/TraceCredit-RL.git /home/luwa/Documents/Tree-GRPO
+cd /home/luwa/Documents/Tree-GRPO
+
+# 2. Checkpoints + data
+hf download lumos2548/treegrpo-rl-opd-handoff --repo-type dataset --local-dir .
+
+# 3. Restore checkpoint layout (HF paths are flat, local layout is nested)
+mkdir -p verl_checkpoints
+mv singlehopqa-sft-search-r1-qwen2.5-3b-instruct verl_checkpoints/
+mv tracecredit-nodeskill-sampled-nll-opd-formal-entropy-chunked-retry-20260925 verl_checkpoints/
+
+# 4. Public resources (not in the HF repo; fetch from official sources)
+#    Teacher:  Qwen/Qwen2.5-7B-Instruct          -> models/Qwen2.5-7B-Instruct (GPU 0, port 8126)
+#    Retriever: intfloat/e5-base-v2 + flashRAG wiki-18 corpus + e5 Flat index (:8000)
+#    Env:      rebuild .conda/envs/treegrpo from pyproject.toml / requirements.txt
+
+# 5. Resume (auto-detects the latest complete checkpoint)
+bash scripts/run_tracecredit_nodeskill_opd_formal_entropy.sh
+```
+
 ## License
 
 See [LICENSE](LICENSE).
