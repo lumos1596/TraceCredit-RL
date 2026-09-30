@@ -1,0 +1,22 @@
+# Manual audit of teacher rescue paths, 2026-09-29
+
+This audit reads the teacher queries, top-3 documents, handoffs, and frozen SFT350 continuations for every one of the eight questions whose selected first teacher retrieval contains a gold alias. A literal alias is only a screening rule; the path judgment below is manual.
+
+| UID | First teacher path | Student result under one teacher search | Second teacher search | Judgment |
+| --- | --- | --- | --- | --- |
+| `2wikimultihopqa:4269` | Charles Edward Chambers birth-date page is correct, but Patryk's date is missing. | Student makes the correct follow-up query, but retrieval returns Patryk Jaki pages and never answers. | Correct intended query for Patryk, same wrong retrieval. | Incomplete first path; retrieval failure, not student reasoning failure. |
+| `hotpotqa:14537` | Moonrunners query is relevant; it exposes the needed father/theme-song relation only indirectly. | Student searches Thunder Road, resolves the relation, and answers James Mitchum correctly. | Waylon Jennings query follows a wrong branch. | First path usable; second path is wrong. |
+| `hotpotqa:27074` | Shortugai/lapis query gives the correct chain: 7th millennium BC → Sar-i Sang mines in Badakhshan. | Student explicitly reasons that Sar-i Sang is the mine, then answers the broader region `Badakhshan`. | Direct Sar-i Sang query is rejected by the no-answer-leak rule. | Correct prefix; student answer-granularity failure. |
+| `hotpotqa:33700` | White Wilderness date is correct but comparison requires Oz's date. | Student retrieves Oz and answers White Wilderness correctly. | Oz date query and documents are correct. Student redundantly searches White Wilderness and Oz again, exhausting its suffix without answering. | Both teacher searches are correct; the inherited one-hop handoff causes redundant student search. |
+| `hotpotqa:42622` | Ammobium query retrieves Gnaphalium/other pages, not evidence for Ammobium. | Student searches Sidalcea and happens to answer Yes, but the chain is not grounded. | Sidalcea query retrieves Sidalcea pages but still does not repair Ammobium evidence. | First path is incorrect; apparent success is unsupported. |
+| `hotpotqa:63638` | A Tiger Walks producer page supports Walt Disney Productions. | Student finds Lion King and answers Walt Disney Productions. | Lion King producer query returns franchise pages, not the needed producer fact. | First path is usable; the EM miss is target normalization (`Walt Disney` versus `Walt Disney Productions`) rather than a substantive path error. |
+| `musique:6075` | Elvis-files page supports the FBI/Elvis part but not Ashcroft's assignment. | Student retrieves the missing agency relation and answers Yes. | Ashcroft query returns unrelated pages and leads to No. | First path is incomplete but recoverable; the stored target aliases are entity phrases rather than the question's yes/no form, so the EM diagnostic marks a semantically sensible Yes as wrong. |
+| `musique:9519` | LaHave/Middle LaHave pages directly support Lunenburg Municipal District. | Student verifies and answers Lunenburg Municipal District correctly. | Malagawatch country query is irrelevant to the remaining district relation, but student still answers correctly. | First path sufficient; second path adds no value. |
+
+## Findings
+
+Only three of the eight alias-bearing first searches are sufficient or nearly sufficient for the final answer: Sar-i Sang, White Wilderness, and LaHave. Two are usable bridges requiring one student follow-up; one is merely partial; one is wrong; and one is confounded by a target-format mismatch.
+
+The current two-search experiment is therefore not a clean test of whether a correct first-and-second teacher prefix helps. It mixes: wrong second paths, failed second retrievals, and a one-search handoff that continues to tell the student to verify. In the White Wilderness case, both teacher searches are correct, but the student repeats both searches and never emits an answer. This is a control-policy problem: after a second teacher observation the handoff must switch from `verify/search` to `synthesize an answer now`, and it should be applied only when the second evidence actually covers the missing relation.
+
+The next valid two-search test should use only manually or automatically evidence-gated chains, retain the question and both supporting facts in the visible observation window, and use a post-second-search answer-synthesis handoff. It must not reuse the one-search handoff unchanged.

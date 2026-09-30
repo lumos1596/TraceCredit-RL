@@ -37,6 +37,8 @@ actor_rollout_ref:
     # Query-only on-policy self-distillation. Rollout-side tensors are built
     # only for same-parent sibling sets with both successful and failed leaves.
     self_opd_enabled: False
+    teacher_rescue_enabled: False
+    teacher_rescue_kd_coef: 0.01
     self_opd_coef: 0.0
     self_opd_temperature: 1.0
     # Event-level gate on mean teacher-minus-student target-query log-prob.
@@ -45,7 +47,6 @@ actor_rollout_ref:
     self_opd_query_coef: 1.0
     self_opd_loss: jsd
     # sampled_nll uses a hard positive-lift gate followed by sigmoid(beta*delta).
-    self_opd_beta: 5.0
     self_opd_delta_min: 0.0
     # Remote privileged teacher (e.g. a 7B answer-conditioned server). Empty
     # keeps the legacy local self-teacher forward.

@@ -21,6 +21,9 @@ from verl.utils.reward_score import qa_em, qa_em_format, qa_f1_format
 from verl.trainer.ppo.ray_trainer_ts import RayPPOTrainer
 import re
 import numpy as np
+import json
+import os
+import urllib.request
 
 def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'web_questions', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle', 'strategyqa']:
@@ -40,6 +43,29 @@ class RewardManager():
         self.structure_format_score = structure_format_score
         self.final_format_score = final_format_score
         self.retrieval_score = retrieval_score
+        self.semantic_reward_url = os.environ.get('SEMANTIC_REWARD_URL', '').rstrip('/')
+
+    def _semantic_judgments(self, items):
+        if not self.semantic_reward_url or not items:
+            return [False] * len(items)
+        values = []
+        for start in range(0, len(items), 64):
+            batch = items[start:start + 64]
+            request = urllib.request.Request(
+                self.semantic_reward_url + '/semantic_judge',
+                data=json.dumps({'items': batch}, ensure_ascii=False).encode(),
+                headers={'Content-Type': 'application/json'}, method='POST')
+            try:
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    payload = json.load(response)
+                judgments = payload['judgments']
+                if len(judgments) != len(batch):
+                    raise ValueError('semantic judge returned wrong batch size')
+                values.extend(bool(item.get('equivalent')) for item in judgments)
+            except Exception as error:
+                print(f'[semantic reward] strict-EM fallback: {type(error).__name__}: {error}', flush=True)
+                values.extend([False] * len(batch))
+        return values
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -53,6 +79,7 @@ class RewardManager():
         all_scores = []
 
         already_print_data_sources = {}
+        semantic_candidates = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -88,6 +115,19 @@ class RewardManager():
             reward_tensor[i, valid_response_length - 1] = score
             all_scores.append(score)
 
+            if self.semantic_reward_url and data_source in [
+                    'nq', 'triviaqa', 'popqa', 'web_questions', 'hotpotqa',
+                    '2wikimultihopqa', 'musique', 'bamboogle', 'strategyqa']:
+                answer = qa_em_format.extract_solution(sequences_str)
+                targets = ground_truth.get('target', [])
+                targets = [targets] if isinstance(targets, str) else [str(value) for value in targets]
+                if answer is not None and not qa_em_format.em_check(answer, targets):
+                    question_match = re.search(r'Question:\s*(.*?)<\|im_end\|>', sequences_str, flags=re.S)
+                    question = question_match.group(1).strip() if question_match else sequences_str[:1800]
+                    semantic_candidates.append((i, valid_response_length, sequences_str, {
+                        'question': question, 'reference_answers': targets, 'model_answer': answer,
+                    }))
+
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
 
@@ -95,6 +135,17 @@ class RewardManager():
                 already_print_data_sources[data_source] += 1
                 print(sequences_str)
 
+        accepted = self._semantic_judgments([item for *_meta, item in semantic_candidates])
+        for (i, valid_response_length, sequences_str, _item), equivalent in zip(semantic_candidates, accepted):
+            if not equivalent:
+                continue
+            valid_format = qa_em_format.is_valid_sequence(sequences_str)[0]
+            semantic_score = 1.0 if valid_format else 1.0 - self.structure_format_score
+            all_scores[i] = semantic_score
+            reward_tensor[i].zero_()
+            reward_tensor[i, valid_response_length - 1] = semantic_score
+        if semantic_candidates:
+            print(f'[semantic reward] accepted={sum(accepted)}/{len(accepted)}', flush=True)
         return all_scores, reward_tensor
 
 
@@ -189,8 +240,9 @@ def main_task(config):
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
+    if not config.trainer.get("val_only", False):
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -199,8 +251,9 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if not config.trainer.get("val_only", False):
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 _NODE_SKILL_FIELDS = ("failure_type", "missing_relation", "next_operation", "stop_condition")
+_OPID_SKILL_FIELDS = ("episode_summary", "episode_skill", "step_skills")
 
 
 def _request_node_skill(url: str, prompt: str, timeout: float = 120.0) -> Optional[dict]:
@@ -41,7 +42,7 @@ def _request_node_skill(url: str, prompt: str, timeout: float = 120.0) -> Option
     return skill if isinstance(skill, dict) else None
 
 
-def _validate_node_skill(skill: dict, *, gold_answer: str, queries: Sequence[str]) -> bool:
+def _validate_node_skill(skill: dict, *, gold_answer: str, queries: Sequence[str], visible_state: str = "") -> bool:
     if set(skill) != set(_NODE_SKILL_FIELDS):
         return False
     values = [str(skill.get(field, "")).strip() for field in _NODE_SKILL_FIELDS]
@@ -56,9 +57,14 @@ def _validate_node_skill(skill: dict, *, gold_answer: str, queries: Sequence[str
     answer = _normalized_words(gold_answer)
     if answer and answer in normalized:
         return False
+    visible_normalized = _normalized_words(visible_state)
     for query in queries:
         query_norm = _normalized_words(query)
-        if len(query_norm.split()) >= 3 and query_norm in normalized:
+        if (
+            len(query_norm.split()) >= 3
+            and query_norm in normalized
+            and not set(query_norm.split()).issubset(set(visible_normalized.split()))
+        ):
             return False
     return True
 
@@ -66,7 +72,7 @@ def _validate_node_skill(skill: dict, *, gold_answer: str, queries: Sequence[str
 def _node_skill_prompt(state: str, good_action: str, bad_action: str, evidence: str) -> str:
     return f"""Create one node-level procedural skill for a search agent. Return ONLY JSON.
 Schema: {{"failure_type":"short category","missing_relation":"abstract unresolved relation or evidence gap","next_operation":"one executable verification/search operation","stop_condition":"what must be verified before advancing"}}
-Do not reveal or infer the final answer. Do not copy either action, a document title, retrieved sentence, date, number, newly revealed entity, or answer-bearing fact. Do not mention rewards, scores, branches, gold evidence, hindsight, or which action was better. Use only entity types, relation types, ambiguity types, evidence gaps, and verification operations.
+Do not reveal or infer the final answer. You MAY name entities, works, places, and relations that already appear in the Current visible state, because the agent already knows them. Do not copy either historical action verbatim. Do not quote a retrieved sentence, date, number, newly revealed entity, or answer-bearing fact that appears only in the private action or private evidence sections. Do not mention rewards, scores, branches, gold evidence, hindsight, or which action was better. Produce a concrete verification operation while using only information available in the Current visible state.
 Current visible state:
 {state[-9000:]}
 Historical unsuccessful action:
@@ -76,6 +82,51 @@ Historical more useful action (private; do not copy):
 Retrieved evidence (private; do not copy):
 {evidence[:1800]}
 """
+
+
+def _opid_analyzer_prompt(task: str, outcome: bool, candidate_steps: Sequence[int],
+                          formatted_steps: str, max_skill_count: int) -> str:
+    """Paper Appendix Figure 9 analyzer prompt, adapted only to JSON formatting."""
+    return f"""Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete all three fields:
+1. Write a concise episode_summary.
+2. Write one episode_skill that extracts the successful trajectory into workflow: the core decision rule and action ordering that made this trajectory work. / Write one episode_skill that extracts the failed trajectory into avoidance rules: the core mistake and warning signs that agent should avoid.
+3. Provide concise, action-oriented decision guidance for at most {max_skill_count} critical step(s) from the candidate set as entries in step_skills; use the full episode to infer the guidance, but phrase each skill as advice the policy can act on at that step.
+
+Important constraints:
+- Step indexing is 0-based: step 0 is the first step of the trajectory.
+- Use the task description together with the episode context to judge progress and mistakes.
+- Use the full episode context to identify what each critical step should have done better.
+- Each step_skills value should be one short imperative sentence for the policy at that step.
+- Write step_skills as policy-facing guidance, not as retrospective explanation of the trajectory.
+- Return only these top-level fields: episode_summary, episode_skill, step_skills.
+- The chosen steps are exactly the keys present in step_skills.
+
+Return format:
+{{"episode_summary":"string","episode_skill":"string","step_skills":{{"0":"skill for step 0","2":"skill for step 2"}}}}
+
+Episode context:
+- Task description: {task}
+- episode_success: {str(bool(outcome)).lower()}
+- Candidate step indices: {json.dumps(list(candidate_steps))}
+- Interaction trajectory:
+{formatted_steps}
+"""
+
+
+def _validate_opid_skill(skill: dict, candidate_steps: Sequence[int]) -> bool:
+    if not isinstance(skill, dict) or set(skill) != set(_OPID_SKILL_FIELDS):
+        return False
+    if not all(isinstance(skill.get(field), str) and skill[field].strip()
+               for field in ("episode_summary", "episode_skill")):
+        return False
+    step_skills = skill.get("step_skills")
+    if not isinstance(step_skills, dict):
+        return False
+    allowed = {str(index) for index in candidate_steps}
+    return all(str(key) in allowed and isinstance(value, str) and value.strip()
+               for key, value in step_skills.items())
 
 
 @dataclass(frozen=True)
@@ -374,6 +425,108 @@ def _dense_teacher_event(
     )
 
 
+
+def _paper_teacher_events(
+    leaf,
+    tokenizer,
+    *,
+    max_teacher_length: int,
+    max_query_tokens: int,
+    max_action_tokens: int,
+    min_value_gap: float,
+    analyzer_url: str,
+    max_skill_count: int,
+    global_failure_only: bool = False,
+) -> List[_TeacherEvent]:
+    """Build Appendix-B critical-first events from one completed trajectory."""
+    if not analyzer_url:
+        return []
+    path = _path_from_root(leaf)
+    if not path:
+        return []
+    episode_success = float(getattr(leaf, "node_value", 0.0)) >= 0.8
+    if global_failure_only and episode_success:
+        return []
+
+    candidate_steps = []
+    formatted = []
+    for step_index, node in enumerate(path):
+        parent = node.parent_node
+        siblings = _query_siblings(parent, tokenizer, max_query_tokens, max_action_tokens)
+        sibling_values = [float(getattr(sibling, "node_value", 0.0))
+                          for sibling, _, _ in siblings]
+        if (len(sibling_values) >= 2
+                and max(sibling_values) - min(sibling_values) >= min_value_gap):
+            candidate_steps.append(step_index)
+        start = 0 if parent.is_root else _valid_length(parent)
+        end = _valid_length(node)
+        edge_ids = [
+            int(token) for token in node.responses[start:end].detach().cpu().tolist()
+        ]
+        formatted.append(f"[Step {step_index}]\n"
+                         + tokenizer.decode(edge_ids, skip_special_tokens=False))
+
+    pad_id = int(tokenizer.pad_token_id)
+    root = path[0].parent_node
+    task_ids = _valid_tokens(root.prompts, None, pad_id)
+    task = tokenizer.decode(task_ids, skip_special_tokens=False)
+    prompt = _opid_analyzer_prompt(
+        task=task,
+        outcome=episode_success,
+        candidate_steps=candidate_steps,
+        formatted_steps="\n".join(formatted),
+        max_skill_count=max_skill_count,
+    )
+    skill = _request_node_skill(analyzer_url, prompt)
+    if skill is None or not _validate_opid_skill(skill, candidate_steps):
+        return []
+
+    step_skills = {str(key): str(value).strip()
+                   for key, value in skill["step_skills"].items()}
+    episode_skill = str(skill["episode_skill"]).strip()
+    events = []
+    for step_index, node in enumerate(path):
+        parent = node.parent_node
+        query_span = extract_edge_query_span(node, tokenizer)
+        span = extract_edge_policy_span(node, tokenizer, max_action_tokens)
+        if query_span is None or len(query_span.token_ids) > max_query_tokens or span is None:
+            continue
+        routed_skill = (
+            episode_skill if global_failure_only
+            else step_skills.get(str(step_index), episode_skill)
+        )
+        instruction = (
+            "\n<information>Procedural guidance: "
+            + routed_skill
+            + "</information>\n"
+        )
+        suffix = _encode(tokenizer, instruction)
+        target_ids = list(span.action_ids)
+        required = len(suffix) + len(target_ids)
+        if required > max_teacher_length:
+            continue
+        base, context_truncated, prompt_fraction = _anchored_prefix(
+            parent, tokenizer, max_teacher_length - required
+        )
+        teacher_ids = base + suffix + target_ids
+        target_start = len(base) + len(suffix)
+        events.append(_TeacherEvent(
+            teacher_ids=tuple(teacher_ids),
+            teacher_positions=tuple(target_start + offset - 1
+                                    for offset in span.selected_offsets),
+            student_positions=span.student_positions,
+            think_mask=span.think_mask,
+            query_mask=span.query_mask,
+            weight=1.0,
+            raw_advantage=0.0,
+            value_gap=0.0,
+            target_value=float(getattr(node, "node_value", 0.0)),
+            sibling_count=len(getattr(parent, "child_node", [])),
+            context_truncated=bool(context_truncated),
+            prompt_retained_fraction=float(prompt_fraction),
+        ))
+    return events
+
 def _teacher_event(
     node,
     tokenizer,
@@ -457,7 +610,7 @@ def _teacher_event(
             analyzer_url, _node_skill_prompt(state, good_action, bad_action, evidence)
         )
         if skill is None or not _validate_node_skill(
-            skill, gold_answer=str(gold_answer or ""), queries=queries
+            skill, gold_answer=str(gold_answer or ""), queries=queries, visible_state=state
         ):
             return None
         rendered = json.dumps(
@@ -554,12 +707,12 @@ def build_self_opd_batch(
         raise ValueError("self_opd max_evidence_tokens must be non-negative")
     if min_value_gap < 0 or min_raw_advantage < 0 or max_advantage_weight <= 0:
         raise ValueError("Self-OPD gap/advantage bounds are invalid")
-    if teacher_context not in ("hindsight", "answer", "node_skill"):
+    if teacher_context not in ("hindsight", "answer", "node_skill", "opid_paper", "opid_global_failure"):
         raise ValueError(f"unknown self_opd teacher_context: {teacher_context!r}")
     if event_selection not in ("contrast", "all"):
         raise ValueError(f"unknown self_opd event_selection: {event_selection!r}")
-    if event_selection == "all" and teacher_context != "answer":
-        raise ValueError("event_selection='all' requires teacher_context='answer'")
+    if event_selection == "all" and teacher_context not in ("answer", "opid_paper", "opid_global_failure"):
+        raise ValueError("event_selection='all' requires answer or opid_paper context")
     if gold_answers is not None and len(gold_answers) != len(final_node_list):
         raise ValueError("gold_answers must align with final_node_list")
 
@@ -585,7 +738,20 @@ def build_self_opd_batch(
     for batch_index, leaf in enumerate(final_node_list):
         events = []
         gold_answer = gold_answers[batch_index] if gold_answers is not None else None
-        for node in _path_from_root(leaf):
+        if teacher_context in ("opid_paper", "opid_global_failure"):
+            events = _paper_teacher_events(
+                leaf,
+                tokenizer,
+                max_teacher_length=max_teacher_length,
+                max_query_tokens=max_query_tokens,
+                max_action_tokens=max_action_tokens,
+                min_value_gap=min_value_gap,
+                analyzer_url=analyzer_url,
+                max_skill_count=max_events,
+                global_failure_only=(teacher_context == "opid_global_failure"),
+            )
+        for node in ([] if teacher_context in ("opid_paper", "opid_global_failure")
+                     else _path_from_root(leaf)):
             if event_selection == "all":
                 # Tree leaves share ancestors; distill each query node once,
                 # on the first leaf whose path reaches it.  Positions index the

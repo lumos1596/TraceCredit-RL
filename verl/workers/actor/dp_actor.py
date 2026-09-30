@@ -169,33 +169,28 @@ def sampled_nll_opd_components(
     event_mask,
     event_advantage,
     *,
-    beta=5.0,
     delta_min=0.0,
     think_coef=0.2,
     query_coef=1.0,
 ):
     """Return the weighted sampled-NLL numerator and detached weights.
 
-    Both the skill-induced lift and all gates are deliberately detached.  The
-    only gradient path is therefore through the ordinary-context likelihood of
-    the exact on-policy tokens that were sampled during rollout.
+    Weight each sampled target token directly by its positive skill-induced
+    log-probability lift. The lift and all gates are detached.
     """
-    if float(beta) <= 0:
-        raise ValueError('self_opd_beta must be positive')
     if not math.isfinite(float(delta_min)):
         raise ValueError('self_opd_delta_min must be finite')
     delta = (skill_target_log_probs - student_target_log_probs).detach()
     advantage = event_advantage.detach().clamp_min(0.0).unsqueeze(-1)
     valid = token_mask.bool() & event_mask.bool().unsqueeze(-1)
-    positive_lift = delta > float(delta_min)
+    positive_lift = (delta - float(delta_min)).clamp_min(0.0)
     span_weights = _opd_span_weights(
         think_mask, query_mask, think_coef, query_coef
     )
     weights = (
         valid.float()
-        * positive_lift.float()
+        * positive_lift
         * advantage
-        * torch.sigmoid(float(beta) * delta)
         * span_weights
     ).detach()
     numerator = -(student_target_log_probs * weights).sum()
@@ -221,8 +216,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
         if self.config.get('self_opd_enabled', False):
-            if self.config.get('self_opd_loss', 'jsd') not in ('jsd', 'sampled_nll'):
-                raise ValueError('self_opd_loss must be jsd or sampled_nll')
+            if self.config.get('self_opd_loss', 'jsd') not in ('jsd', 'sampled_nll', 'opid_advantage'):
+                raise ValueError('self_opd_loss must be jsd, sampled_nll, or opid_advantage')
             if float(self.config.get('self_opd_coef', 0.0)) < 0:
                 raise ValueError('self_opd_coef must be non-negative')
             if float(self.config.get('self_opd_temperature', 1.0)) <= 0:
@@ -233,8 +228,6 @@ class DataParallelPPOActor(BasePPOActor):
                 raise ValueError('self_opd_think_coef must be non-negative')
             if float(self.config.get('self_opd_query_coef', 1.0)) <= 0:
                 raise ValueError('self_opd_query_coef must be positive')
-            if float(self.config.get('self_opd_beta', 5.0)) <= 0:
-                raise ValueError('self_opd_beta must be positive')
             if not math.isfinite(float(self.config.get('self_opd_delta_min', 0.0))):
                 raise ValueError('self_opd_delta_min must be finite')
         self.self_opd_teacher_url = str(self.config.get('self_opd_teacher_url', '') or '')
@@ -664,7 +657,6 @@ class DataParallelPPOActor(BasePPOActor):
                     query_mask[sample_index],
                     event_mask[sample_index],
                     data['self_opd_event_weight'][sample_index],
-                    beta=self.config.get('self_opd_beta', 5.0),
                     delta_min=self.config.get('self_opd_delta_min', 0.0),
                     think_coef=self.config.get('self_opd_think_coef', 0.2),
                     query_coef=self.config.get('self_opd_query_coef', 1.0),
@@ -722,6 +714,108 @@ class DataParallelPPOActor(BasePPOActor):
             directional_stats.detach(),
         )
 
+    def _compute_self_opid_advantages(self, data):
+        """Compute detached OPID token advantages with the frozen old policy."""
+        teacher_ids = data['self_opd_teacher_input_ids']
+        teacher_attention = data['self_opd_teacher_attention_mask'].bool()
+        teacher_positions = data['self_opd_teacher_query_positions']
+        student_positions = data['self_opd_student_query_positions']
+        token_mask = data['self_opd_token_mask'].bool()
+        # Search-task adaptation validated offline: OPID supervises only the
+        # sampled query tokens, while Tree-GRPO retains responsibility for
+        # reasoning and all other response tokens.
+        query_mask = data['self_opd_query_mask'].bool()
+        event_mask = data['self_opd_event_mask'].bool()
+        input_ids = data['input_ids']
+        old_log_probs = data['old_log_probs']
+        response_length = data['responses'].size(-1)
+        response_start = input_ids.size(-1) - response_length
+        temperature = float(self.config.get('self_opd_temperature', 1.0))
+        device_type = input_ids.device.type
+        autocast_enabled = device_type == 'cuda'
+
+        batch_size, max_events, teacher_length = teacher_ids.shape
+        max_action_tokens = student_positions.size(-1)
+        teacher_window_tokens = min(teacher_length, max_action_tokens + 64)
+        teacher_keep_start = teacher_length - teacher_window_tokens
+        teacher_keep = torch.arange(
+            teacher_keep_start, teacher_length - 1,
+            device=teacher_ids.device, dtype=torch.long,
+        )
+        skill_advantages = old_log_probs.new_zeros(old_log_probs.shape)
+        # delta sum, |delta| sum, positive count, token count, event count,
+        # ordinary logp sum, skill logp sum
+        stats = old_log_probs.new_zeros((7,), dtype=torch.float64)
+
+        for sample_index in range(batch_size):
+            sample_teacher_ids = teacher_ids[sample_index].clone()
+            sample_teacher_attention = teacher_attention[sample_index].clone()
+            invalid_events = ~event_mask[sample_index]
+            if invalid_events.any():
+                sample_teacher_attention[invalid_events, -2:] = True
+                sample_teacher_ids[invalid_events, -2:] = 0
+            sample_teacher_position_ids = (
+                sample_teacher_attention.long().cumsum(dim=-1) - 1
+            ).clamp_min(0) * sample_teacher_attention.long()
+            with torch.no_grad(), torch.autocast(
+                device_type=device_type, dtype=torch.bfloat16,
+                enabled=autocast_enabled,
+            ):
+                teacher_output = self.actor_module(
+                    input_ids=sample_teacher_ids,
+                    attention_mask=sample_teacher_attention,
+                    position_ids=sample_teacher_position_ids,
+                    use_cache=False,
+                    logits_to_keep=teacher_keep,
+                )
+                teacher_log_probs = torch.log_softmax(
+                    teacher_output.logits.float() / temperature, dim=-1
+                )
+
+            event_valid = (
+                token_mask[sample_index]
+                & query_mask[sample_index]
+                & event_mask[sample_index].unsqueeze(-1)
+            )
+            teacher_offsets = teacher_positions[sample_index] - teacher_keep_start
+            safe_teacher_offsets = torch.where(
+                event_valid, teacher_offsets, torch.zeros_like(teacher_offsets)
+            )
+            if event_valid.any():
+                valid_offsets = teacher_offsets[event_valid]
+                if valid_offsets.min() < 0 or valid_offsets.max() >= teacher_log_probs.size(1):
+                    raise ValueError('OPID teacher token position is out of bounds')
+            aligned_teacher = teacher_log_probs.gather(
+                1, safe_teacher_offsets.unsqueeze(-1).expand(-1, -1, teacher_log_probs.size(-1))
+            )
+            response_positions = student_positions[sample_index]
+            safe_response_positions = torch.where(
+                event_valid, response_positions, torch.zeros_like(response_positions)
+            )
+            target_positions = response_start + safe_response_positions
+            target_ids = input_ids[sample_index].gather(
+                0, target_positions.reshape(-1)
+            ).reshape(max_events, max_action_tokens)
+            skill_log_probs = aligned_teacher.gather(
+                -1, target_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            ordinary_log_probs = old_log_probs[sample_index].gather(
+                0, safe_response_positions.reshape(-1)
+            ).reshape(max_events, max_action_tokens)
+            delta = (skill_log_probs - ordinary_log_probs).detach()
+            valid_positions = response_positions[event_valid]
+            valid_delta = delta[event_valid]
+            if valid_positions.numel():
+                skill_advantages[sample_index, valid_positions] = valid_delta
+            stats[0] += valid_delta.double().sum()
+            stats[1] += valid_delta.double().abs().sum()
+            stats[2] += (valid_delta > 0).double().sum()
+            stats[3] += event_valid.double().sum()
+            stats[4] += event_mask[sample_index].double().sum()
+            stats[5] += ordinary_log_probs[event_valid].double().sum()
+            stats[6] += skill_log_probs[event_valid].double().sum()
+        return skill_advantages.detach(), stats.detach()
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -755,24 +849,61 @@ class DataParallelPPOActor(BasePPOActor):
                 'self_opd_context_truncated',
                 'self_opd_prompt_retained_fraction',
             ])
+        if self.config.get('teacher_rescue_enabled', False):
+            select_keys.append('teacher_rescue_kd_mask')
         batch = data.select(batch_keys=select_keys).batch
+
+        metrics = {}
+        opid_mode = (
+            self.config.get('self_opd_enabled', False)
+            and self.config.get('self_opd_loss', 'jsd') == 'opid_advantage'
+        )
+        if opid_mode:
+            opid_advantages, opid_stats = self._compute_self_opid_advantages(batch.cuda())
+            skill_coef = float(self.config.get('self_opd_coef', 0.0))
+            batch['advantages'] = (
+                batch['advantages']
+                + skill_coef * opid_advantages.to(batch['advantages'].device)
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(opid_stats, op=torch.distributed.ReduceOp.SUM)
+            token_total = opid_stats[3].clamp_min(1.0)
+            local_response_total = batch['responses'].numel()
+            response_total = torch.tensor(
+                float(local_response_total), dtype=torch.float64, device=opid_stats.device
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(response_total, op=torch.distributed.ReduceOp.SUM)
+            append_to_dict(metrics, {
+                'self_opd/mode_opid_advantage': 1.0,
+                'self_opd/coef': skill_coef,
+                'self_opd/events_per_update': opid_stats[4].item(),
+                'self_opd/token_coverage': (opid_stats[3] / response_total.clamp_min(1.0)).item(),
+                'self_opd/skill_advantage_mean': (opid_stats[0] / token_total).item(),
+                'self_opd/skill_advantage_abs_mean': (opid_stats[1] / token_total).item(),
+                'self_opd/skill_advantage_positive_fraction': (opid_stats[2] / token_total).item(),
+                'self_opd/ordinary_target_logprob_mean': (opid_stats[5] / token_total).item(),
+                'self_opd/skill_target_logprob_mean': (opid_stats[6] / token_total).item(),
+            })
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
+        ppo_epochs = int(self.config.get('ppo_epochs', 1))
+        if ppo_epochs < 1:
+            raise ValueError('ppo_epochs must be at least 1')
 
-        metrics = {}
         # Slots 0-14: rollout/event diagnostics. Slot 15 accumulates the raw
         # self_opd_loss so it can be all-reduced: DataProto.concat keeps only
         # rank 0's meta_info, so a local metric would hide events that ran on
         # other ranks.  After the reduce, loss/world_size is the global
         # token-mean JSD.
         self_opd_update_stats = [0.0] * 20
-        for batch_idx, data in enumerate(dataloader):
+        for batch_idx, data in enumerate(dataloader * ppo_epochs):
             # split batch into micro_batches
             mini_batch = data
             self_opd_normalization_weight = None
-            if self.config.get('self_opd_enabled', False):
+            if self.config.get('self_opd_enabled', False) and not opid_mode:
                 valid_event_mask = mini_batch['self_opd_event_mask'].bool()
                 valid_token_mask = mini_batch['self_opd_token_mask'].bool()
                 valid_think_mask = mini_batch['self_opd_think_mask'].bool()
@@ -939,13 +1070,21 @@ class DataParallelPPOActor(BasePPOActor):
                         'actor/kl_coef': self.config.kl_loss_coef,
                     })
 
+                if self.config.get('teacher_rescue_enabled', False):
+                    kd_mask = data['teacher_rescue_kd_mask'].bool()
+                    kd_loss = -(log_prob * kd_mask).sum() / kd_mask.sum().clamp_min(1)
+                    policy_loss = policy_loss + float(self.config.get('teacher_rescue_kd_coef', 0.01)) * kd_loss
+                    append_to_dict(metrics, {
+                        'teacher_rescue/kd_loss': kd_loss.detach().item(),
+                        'teacher_rescue/kd_tokens': kd_mask.sum().item(),
+                    })
                 loss = policy_loss / self.gradient_accumulation
                 loss.backward()
 
                 # Use a separate forward/backward pair for Self-OPD.  This
                 # avoids retaining the PPO graph across additional FSDP
                 # forwards and substantially lowers peak activation memory.
-                if self.config.get('self_opd_enabled', False):
+                if self.config.get('self_opd_enabled', False) and not opid_mode:
                     (
                         self_opd_loss,
                         self_opd_token_weight,
@@ -975,9 +1114,9 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self._optimizer_step()
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
-        if self.config.get('self_opd_enabled', False):
+        if self.config.get('self_opd_enabled', False) and not opid_mode:
             diagnostic_totals = torch.tensor(
-                self_opd_update_stats,
+                [value / ppo_epochs for value in self_opd_update_stats],
                 dtype=torch.float64,
                 device=torch.device('cuda', torch.cuda.current_device()),
             )

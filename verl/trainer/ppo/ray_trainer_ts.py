@@ -41,6 +41,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation_ts import LLMGenerationTreeSearchManager, GenerationTreeSearchConfig
+from search_r1.llm_agent.teacher_rescue import rescue_all_wrong, pure_em_rows
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
@@ -89,7 +90,7 @@ import torch
 from verl.utils.torch_functional import masked_mean
 
 
-def select_dapo_effective_rows(uids, scores, group_size, max_groups=None, correct_threshold=0.8):
+def select_dapo_effective_rows(uids, scores, group_size, max_groups=None, correct_threshold=0.8, rescue_uids=()):
     """Return rows from EM-mixed groups, following DAPO dynamic sampling.
 
     A trajectory is treated as EM-correct when its shaped QA score is at least
@@ -102,6 +103,8 @@ def select_dapo_effective_rows(uids, scores, group_size, max_groups=None, correc
         grouped_rows.setdefault(uid, []).append(row)
 
     effective_uids = []
+    rescue_uids = set(rescue_uids)
+    rescued_groups = 0
     all_correct = 0
     all_wrong = 0
     for uid, rows in grouped_rows.items():
@@ -110,6 +113,9 @@ def select_dapo_effective_rows(uids, scores, group_size, max_groups=None, correc
         correct = sum(float(scores[row]) >= correct_threshold for row in rows)
         if correct == 0:
             all_wrong += 1
+            if uid in rescue_uids:
+                effective_uids.append(uid)
+                rescued_groups += 1
         elif correct == group_size:
             all_correct += 1
         else:
@@ -123,6 +129,7 @@ def select_dapo_effective_rows(uids, scores, group_size, max_groups=None, correc
         'effective_groups': len(effective_uids),
         'all_correct_groups': all_correct,
         'all_wrong_groups': all_wrong,
+        'rescued_groups': rescued_groups,
     }
 
 
@@ -852,6 +859,13 @@ class RayPPOTrainer(object):
                 timing_raw[key] = timing_raw.get(key, 0.0) + value
         dump_chunk_idx = None if accumulation_steps == 1 else chunk_idx
         self._dump_tree_rollouts(final_gen_batch_output, generation_manager, chunk_idx=dump_chunk_idx)
+        if self.config.trainer.get('teacher_rescue_enabled', False):
+            rescue_stats = rescue_all_wrong(
+                final_gen_batch_output, generation_manager,
+                teacher_url=str(self.config.trainer.get('teacher_rescue_url', '')),
+                group_size=ts_m * ts_k,
+            )
+            final_gen_batch_output.meta_info['teacher_rescue_stats'] = rescue_stats
 
         expected_trajectories = prompt_count * ts_m * ts_k
         if len(final_gen_batch_output) != expected_trajectories:
@@ -862,8 +876,23 @@ class RayPPOTrainer(object):
             )
 
         for key in final_gen_batch_output.batch.keys():
-            if key != 'token_level_scores' and not key.startswith('branch_'):
+            # Token/id tensors must be integral, but rollout-side training
+            # signals retain fractional values. Converting Self-OPD event
+            # weights, advantages, and value gaps to long silently zeros them.
+            if (key != 'token_level_scores'
+                    and not key.startswith('branch_')
+                    and not key.startswith('self_opd_')
+                    and key != 'teacher_rescue_kd_mask'):
                 final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
+
+        for key in (
+            'self_opd_event_weight',
+            'self_opd_raw_advantage',
+            'self_opd_value_gap',
+        ):
+            if key in final_gen_batch_output.batch and not torch.is_floating_point(
+                    final_gen_batch_output.batch[key]):
+                raise TypeError(f'{key} must remain floating point after rollout collection')
 
         with torch.no_grad():
             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
@@ -959,6 +988,7 @@ class RayPPOTrainer(object):
         """
         import torch
         reward_tensor_lst = []
+        pure_em_lst = []
         data_source_lst = []
         val_num_samples = int(self.config.trainer.get('val_num_samples', 1))
         val_do_sample = bool(self.config.trainer.get('val_do_sample', val_num_samples > 1))
@@ -1017,6 +1047,7 @@ class RayPPOTrainer(object):
                 _, reward_tensor = self.val_reward_fn(test_batch)
 
                 reward_tensor_lst.append(reward_tensor)
+                pure_em_lst.extend(pure_em_rows(test_batch, self.tokenizer))
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
         else:
             for batch_dict in self.val_dataloader:
@@ -1083,6 +1114,7 @@ class RayPPOTrainer(object):
                                 pass_at_k_values[k].setdefault(source, []).append(score)
 
                     reward_tensor_lst.append(reward_tensor)
+                    pure_em_lst.extend(pure_em_rows(test_batch, self.tokenizer))
                     data_source_lst.append(test_batch.non_tensor_batch.get(
                         'data_source', ['unknown'] * reward_tensor.shape[0]
                     ))
@@ -1098,7 +1130,7 @@ class RayPPOTrainer(object):
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
 
-        metric_dict = {}
+        metric_dict = {'val/pure_em': float(np.mean(pure_em_lst)) if pure_em_lst else 0.0}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
@@ -1373,6 +1405,8 @@ class RayPPOTrainer(object):
                 attempted_trajectories = 0
                 all_correct_groups = 0
                 all_wrong_groups = 0
+                rescue_eligible = rescue_intervened = rescue_successes = rescue_failures = 0
+                raw_correct_trajectories = 0
                 chunk_idx = 0
                 collection_limit = max_chunks if dapo_enabled else accumulation_steps
                 while chunk_idx < collection_limit:
@@ -1404,6 +1438,14 @@ class RayPPOTrainer(object):
                         )
                     attempted_prompts += chunk_prompts
                     attempted_trajectories += chunk_trajectories
+                    rescue_stats = chunk.meta_info.get('teacher_rescue_stats', {})
+                    raw_correct_trajectories += rescue_stats.get('raw_em_count', sum(
+                        float(score) >= 0.8 for score in chunk.non_tensor_batch['original_score']
+                    ))
+                    rescue_eligible += int(rescue_stats.get('eligible', 0))
+                    rescue_intervened += int(rescue_stats.get('intervened', 0))
+                    rescue_successes += int(rescue_stats.get('successes', 0))
+                    rescue_failures += int(rescue_stats.get('failed', 0))
 
                     if dapo_enabled:
                         remaining = target_effective - prompt_count
@@ -1412,9 +1454,10 @@ class RayPPOTrainer(object):
                             chunk.non_tensor_batch['original_score'],
                             group_size=ts_m * ts_k,
                             max_groups=remaining,
+                            rescue_uids=chunk.meta_info.get('teacher_rescue_stats', {}).get('rescued_uids', ()),
                         )
                         all_correct_groups += group_stats['all_correct_groups']
-                        all_wrong_groups += group_stats['all_wrong_groups']
+                        all_wrong_groups += group_stats['all_wrong_groups'] + int(rescue_stats.get('promoted_groups', 0))
                         selected_groups = group_stats['effective_groups']
                         if not selected_rows:
                             continue
@@ -1424,6 +1467,7 @@ class RayPPOTrainer(object):
                     else:
                         prompt_count += chunk_prompts
                         trajectory_count += chunk_trajectories
+                    chunk.meta_info.pop('teacher_rescue_stats', None)
                     rollout_chunks.append(chunk)
 
                 if dapo_enabled and prompt_count < target_effective:
@@ -1466,6 +1510,15 @@ class RayPPOTrainer(object):
                         'dapo/all_correct_groups': all_correct_groups,
                         'dapo/all_wrong_groups': all_wrong_groups,
                         'dapo/group_acceptance_rate': prompt_count / attempted_prompts,
+                        'teacher_rescue/raw_rollout_em': raw_correct_trajectories / max(attempted_trajectories, 1),
+                        'teacher_rescue/all_wrong_prompt_fraction': all_wrong_groups / max(attempted_prompts, 1),
+                        'teacher_rescue/mixed_prompt_fraction': (attempted_prompts - all_wrong_groups - all_correct_groups) / max(attempted_prompts, 1),
+                        'teacher_rescue/eligible_prompts': rescue_eligible,
+                        'teacher_rescue/interventions': rescue_intervened,
+                        'teacher_rescue/intervention_fraction': rescue_intervened / max(attempted_prompts, 1),
+                        'teacher_rescue/successes': rescue_successes,
+                        'teacher_rescue/success_fraction': rescue_successes / max(rescue_intervened, 1),
+                        'teacher_rescue/failed_interventions': rescue_failures,
                     })
                 print(
                     f'[rollout accumulation] optimizer_step={self.global_steps} '
@@ -1479,7 +1532,8 @@ class RayPPOTrainer(object):
                 for key in batch.batch.keys():
                     if (key not in {'old_log_probs', 'token_level_scores'}
                             and not key.startswith('branch_')
-                            and not key.startswith('self_opd_')):
+                            and not key.startswith('self_opd_')
+                            and key != 'teacher_rescue_kd_mask'):
                         batch.batch[key] = batch.batch[key].long()
 
                 if self.use_reference_policy:

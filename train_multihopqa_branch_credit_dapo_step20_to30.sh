@@ -4,7 +4,9 @@
 set -euo pipefail
 
 PROJECT_DIR=/home/luwa/Documents/Tree-GRPO
-PYTHON_BIN="$PROJECT_DIR/.conda/envs/treegrpo/bin/python"
+# Allow a machine-specific environment to be supplied by the launcher while
+# retaining the historical in-repository environment as the fallback.
+PYTHON_BIN=${PYTHON_BIN:-"$PROJECT_DIR/.conda/envs/treegrpo/bin/python"}
 DATA_DIR="$PROJECT_DIR/data/multihopqa_search_mixed_402020_20260830"
 MODEL_DIR=${MODEL_DIR:-"$PROJECT_DIR/verl_checkpoints/singlehopqa-sft-search-r1-qwen2.5-3b-instruct/global_step_350"}
 # An empty INIT_CHECKPOINT intentionally starts directly from MODEL_DIR.  This
@@ -22,13 +24,16 @@ BRANCH_CREDIT_CLIP=${BRANCH_CREDIT_CLIP:-3.0}
 BRANCH_CREDIT_VALUE_MODE=${BRANCH_CREDIT_VALUE_MODE:-reward}
 BRANCH_CREDIT_CORRECTNESS_THRESHOLD=${BRANCH_CREDIT_CORRECTNESS_THRESHOLD:-0.8}
 SELF_OPD_ENABLED=${SELF_OPD_ENABLED:-false}
+TEACHER_RESCUE_ENABLED=${TEACHER_RESCUE_ENABLED:-false}
+TEACHER_RESCUE_URL=${TEACHER_RESCUE_URL:-}
+TEACHER_RESCUE_KD_COEF=${TEACHER_RESCUE_KD_COEF:-0.01}
+PPO_EPOCHS=${PPO_EPOCHS:-1}
 SELF_OPD_COEF=${SELF_OPD_COEF:-0.001}
 SELF_OPD_TEMPERATURE=${SELF_OPD_TEMPERATURE:-1.0}
 SELF_OPD_MIN_DIRECTIONAL_LIFT=${SELF_OPD_MIN_DIRECTIONAL_LIFT:-0.0}
 SELF_OPD_THINK_COEF=${SELF_OPD_THINK_COEF:-0.2}
 SELF_OPD_QUERY_COEF=${SELF_OPD_QUERY_COEF:-1.0}
 SELF_OPD_LOSS=${SELF_OPD_LOSS:-jsd}
-SELF_OPD_BETA=${SELF_OPD_BETA:-5.0}
 SELF_OPD_DELTA_MIN=${SELF_OPD_DELTA_MIN:-0.0}
 SELF_OPD_MAX_EVENTS=${SELF_OPD_MAX_EVENTS:-3}
 SELF_OPD_MAX_TEACHER_LENGTH=${SELF_OPD_MAX_TEACHER_LENGTH:-512}
@@ -46,6 +51,12 @@ SELF_OPD_EVENT_SELECTION=${SELF_OPD_EVENT_SELECTION:-contrast}
 SELF_OPD_TEACHER_URL=${SELF_OPD_TEACHER_URL:-}
 RESUME_GLOBAL_STEP=${RESUME_GLOBAL_STEP:-20}
 RESUME_ACTOR_STATE=${RESUME_ACTOR_STATE:-false}
+TEST_FREQ=${TEST_FREQ:--1}
+VAL_FILE=${VAL_FILE:-"$DATA_DIR/balanced_test.parquet"}
+VAL_DATA_NUM=${VAL_DATA_NUM:-480}
+VAL_ONLY=${VAL_ONLY:-false}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}
+VAL_AT_END=${VAL_AT_END:-false}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-31}
 SAVE_FREQ=${SAVE_FREQ:-10}
 # HFRollout disables the actor's layer-wise FSDP auto-wrap in this verl
@@ -84,6 +95,8 @@ EXPAND_OUTCOME_PRIOR_CONCENTRATION_POWER=${EXPAND_OUTCOME_PRIOR_CONCENTRATION_PO
 ACTOR_LR=${ACTOR_LR:-3e-7}
 SHUFFLE_TRAIN_DATALOADER=${SHUFFLE_TRAIN_DATALOADER:-true}
 ROLLOUT_ACCUMULATION_STEPS=${ROLLOUT_ACCUMULATION_STEPS:-16}
+MAX_TURNS=${MAX_TURNS:-3}
+MAX_START_LENGTH=${MAX_START_LENGTH:-2048}
 DAPO_DYNAMIC_SAMPLING=${DAPO_DYNAMIC_SAMPLING:-true}
 CRITIC_WARMUP=${CRITIC_WARMUP:-0}
 SAVE_AT_END=${SAVE_AT_END:-false}
@@ -96,7 +109,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3}"
 export WG_BACKEND=ray
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export RAY_gsc_rpc_server_reconnect_timeout_s=100
-export CC=/home/luwa/.conda/envs/dsclr/bin/gcc
+# Permit a valid compiler to be supplied by the machine-specific launcher.
+export CC=${CC:-/home/luwa/.conda/envs/dsclr/bin/gcc}
 export TOKENIZERS_PARALLELISM=true
 export PYTHONUNBUFFERED=1
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
@@ -108,7 +122,7 @@ unset PYTORCH_CUDA_ALLOC_CONF
 for required_path in \
     "$PYTHON_BIN" \
     "$DATA_DIR/train.parquet" \
-    "$DATA_DIR/test.parquet" \
+    "$VAL_FILE" \
     "$MODEL_DIR/config.json"; do
     if [[ ! -e "$required_path" ]]; then
         echo "missing required path: $required_path" >&2
@@ -134,14 +148,14 @@ ulimit -n 65535
 
 "$PYTHON_BIN" -m verl.trainer.main_ppo_format_ts \
     data.train_files="$DATA_DIR/train.parquet" \
-    data.val_files="$DATA_DIR/test.parquet" \
+    data.val_files="$VAL_FILE" \
     data.train_data_num=null \
-    data.val_data_num=120 \
+    data.val_data_num="$VAL_DATA_NUM" \
     data.train_batch_size=3 \
     data.val_batch_size=3 \
     data.max_prompt_length=4096 \
     data.max_response_length=500 \
-    data.max_start_length=2048 \
+    data.max_start_length="$MAX_START_LENGTH" \
     data.max_obs_length=500 \
     data.shuffle_train_dataloader="$SHUFFLE_TRAIN_DATALOADER" \
     algorithm.adv_estimator=branch_credit \
@@ -208,22 +222,26 @@ ulimit -n 65535
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.actor.state_masking=true \
+    actor_rollout_ref.actor.ppo_epochs="$PPO_EPOCHS" \
     actor_rollout_ref.actor.self_opd_enabled="$SELF_OPD_ENABLED" \
+    actor_rollout_ref.actor.teacher_rescue_enabled="$TEACHER_RESCUE_ENABLED" \
+    actor_rollout_ref.actor.teacher_rescue_kd_coef="$TEACHER_RESCUE_KD_COEF" \
     actor_rollout_ref.actor.self_opd_coef="$SELF_OPD_COEF" \
     actor_rollout_ref.actor.self_opd_temperature="$SELF_OPD_TEMPERATURE" \
     actor_rollout_ref.actor.self_opd_min_directional_lift="$SELF_OPD_MIN_DIRECTIONAL_LIFT" \
     actor_rollout_ref.actor.self_opd_think_coef="$SELF_OPD_THINK_COEF" \
     actor_rollout_ref.actor.self_opd_query_coef="$SELF_OPD_QUERY_COEF" \
     actor_rollout_ref.actor.self_opd_loss="$SELF_OPD_LOSS" \
-    actor_rollout_ref.actor.self_opd_beta="$SELF_OPD_BETA" \
     actor_rollout_ref.actor.self_opd_delta_min="$SELF_OPD_DELTA_MIN" \
     actor_rollout_ref.actor.self_opd_teacher_url="$SELF_OPD_TEACHER_URL" \
     trainer.logger="$LOGGER" \
-    +trainer.val_only=false \
-    +trainer.val_before_train=false \
-    +trainer.val_at_end=false \
+    +trainer.val_only="$VAL_ONLY" \
+    +trainer.val_before_train="$VAL_BEFORE_TRAIN" \
+    +trainer.val_at_end="$VAL_AT_END" \
     +trainer.rollout_accumulation_steps="$ROLLOUT_ACCUMULATION_STEPS" \
     +trainer.dapo_dynamic_sampling="$DAPO_DYNAMIC_SAMPLING" \
+    +trainer.teacher_rescue_enabled="$TEACHER_RESCUE_ENABLED" \
+    +trainer.teacher_rescue_url="$TEACHER_RESCUE_URL" \
     +trainer.dapo_target_effective_prompts="$DAPO_TARGET_EFFECTIVE_PROMPTS" \
     +trainer.dapo_max_chunks="$DAPO_MAX_CHUNKS" \
     +trainer.resume_global_step="$RESUME_GLOBAL_STEP" \
@@ -234,7 +252,7 @@ ulimit -n 65535
     trainer.n_gpus_per_node="$N_GPUS_PER_NODE" \
     trainer.nnodes=1 \
     trainer.save_freq="$SAVE_FREQ" \
-    trainer.test_freq=-1 \
+    trainer.test_freq="$TEST_FREQ" \
     trainer.project_name=Tree-GRPO \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.total_epochs=2 \
@@ -245,8 +263,8 @@ ulimit -n 65535
     reward_model.final_format_score=0.1 \
     reward_model.retrieval_score=0.1 \
     do_search=true \
-    max_turns=3 \
+    max_turns="$MAX_TURNS" \
     retriever.url="$RETRIEVER_URL" \
     retriever.topk=3 \
     "$@" \
-    2>&1 | tee "$PROJECT_DIR/verl_log/$EXPERIMENT_NAME.log"
+    2>&1 | tee -a "$PROJECT_DIR/verl_log/$EXPERIMENT_NAME.log"
