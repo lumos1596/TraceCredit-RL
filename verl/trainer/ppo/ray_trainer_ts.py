@@ -41,7 +41,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation_ts import LLMGenerationTreeSearchManager, GenerationTreeSearchConfig
-from search_r1.llm_agent.teacher_rescue import rescue_all_wrong, pure_em_rows
+from search_r1.llm_agent.teacher_rescue import rescue_all_wrong, rescue_all_wrong_prefix, pure_em_rows
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
@@ -860,11 +860,20 @@ class RayPPOTrainer(object):
         dump_chunk_idx = None if accumulation_steps == 1 else chunk_idx
         self._dump_tree_rollouts(final_gen_batch_output, generation_manager, chunk_idx=dump_chunk_idx)
         if self.config.trainer.get('teacher_rescue_enabled', False):
-            rescue_stats = rescue_all_wrong(
-                final_gen_batch_output, generation_manager,
-                teacher_url=str(self.config.trainer.get('teacher_rescue_url', '')),
-                group_size=ts_m * ts_k,
-            )
+            rescue_style = str(self.config.trainer.get('teacher_rescue_style', 'legacy'))
+            if rescue_style == 'prefix':
+                rescue_stats = rescue_all_wrong_prefix(
+                    final_gen_batch_output, generation_manager,
+                    teacher_url=str(self.config.trainer.get('teacher_rescue_url', '')),
+                    group_size=ts_m * ts_k,
+                    hops=int(self.config.trainer.get('teacher_rescue_prefix_hops', 2)),
+                )
+            else:
+                rescue_stats = rescue_all_wrong(
+                    final_gen_batch_output, generation_manager,
+                    teacher_url=str(self.config.trainer.get('teacher_rescue_url', '')),
+                    group_size=ts_m * ts_k,
+                )
             final_gen_batch_output.meta_info['teacher_rescue_stats'] = rescue_stats
 
         expected_trajectories = prompt_count * ts_m * ts_k

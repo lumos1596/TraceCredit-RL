@@ -27,6 +27,8 @@ SELF_OPD_ENABLED=${SELF_OPD_ENABLED:-false}
 TEACHER_RESCUE_ENABLED=${TEACHER_RESCUE_ENABLED:-false}
 TEACHER_RESCUE_URL=${TEACHER_RESCUE_URL:-}
 TEACHER_RESCUE_KD_COEF=${TEACHER_RESCUE_KD_COEF:-0.01}
+TEACHER_RESCUE_STYLE=${TEACHER_RESCUE_STYLE:-legacy}
+TEACHER_RESCUE_PREFIX_HOPS=${TEACHER_RESCUE_PREFIX_HOPS:-2}
 PPO_EPOCHS=${PPO_EPOCHS:-1}
 SELF_OPD_COEF=${SELF_OPD_COEF:-0.001}
 SELF_OPD_TEMPERATURE=${SELF_OPD_TEMPERATURE:-1.0}
@@ -242,6 +244,8 @@ ulimit -n 65535
     +trainer.dapo_dynamic_sampling="$DAPO_DYNAMIC_SAMPLING" \
     +trainer.teacher_rescue_enabled="$TEACHER_RESCUE_ENABLED" \
     +trainer.teacher_rescue_url="$TEACHER_RESCUE_URL" \
+    +trainer.teacher_rescue_style="$TEACHER_RESCUE_STYLE" \
+    +trainer.teacher_rescue_prefix_hops="$TEACHER_RESCUE_PREFIX_HOPS" \
     +trainer.dapo_target_effective_prompts="$DAPO_TARGET_EFFECTIVE_PROMPTS" \
     +trainer.dapo_max_chunks="$DAPO_MAX_CHUNKS" \
     +trainer.resume_global_step="$RESUME_GLOBAL_STEP" \

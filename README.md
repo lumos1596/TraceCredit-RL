@@ -101,6 +101,65 @@ Important options:
 
 Batch sizes, rollout budgets, GPU counts, checkpoint paths, and logging backends should be supplied as Hydra overrides for the target environment.
 
+## Current experiment: forkable teacher-prefix tree rescue (2026-10-01)
+
+The active training scheme is **Tree-GRPO (`branch_credit`) + DAPO dynamic
+sampling + Self-OPD + gold-free teacher-prefix rescue**. When DAPO produces an
+all-wrong group (all `m*k` trajectories wrong, which it normally discards and
+gets no gradient from), a teacher supplies the first two
+`think + search` actions; the standard tree rollout then runs on top of that
+prefix and, if any of the resulting leaves answers correctly, the group
+becomes a normal mixed group and re-enters advantage/gradient computation.
+All-wrong groups with no rescued leaf stay invalid and are discarded (they are
+never force-included).
+
+The seeded tree is **forkable**: the tree root holds teacher hop 1 (shared by
+all leaves); the complete 2-hop teacher prefix is one child of the root, while
+the ordinary expansion round (`ts_n=2, ts_l=1`) can also expand directly from
+the root — i.e. fork *before teacher action 2* — so the student may replace
+hop 2 with its own search. Tree parameters, expansion selection,
+`sample_leaf(k=3)`, and branch credit are otherwise identical to a normal
+rollout (`ts_m=2, ts_n=2, ts_l=1, ts_k=3`); the only added variable is the
+teacher prefix. Teacher `think/search` tokens are KD-only (zero on
+observations, excluded from PPO via `info_mask`/`loss_mask`), and the teacher
+root receives no branch advantage by `TreeNode`'s root-skipping path rule.
+
+### Code map
+
+| Component | File / symbol |
+|---|---|
+| Rescue injection (forkable tree build, tree rollout, per-leaf KD masks, reward/branch-credit recompute, all-wrong discard) | `search_r1/llm_agent/teacher_rescue.py`: `rescue_all_wrong_prefix`, `_build_seeded_prefix_tree`, `_prefix_tree_rollout`, `_leaf_kd_mask`, `request_prefix_rescue` |
+| Legacy closed-loop rescue (unchanged, still the default style) | `search_r1/llm_agent/teacher_rescue.py`: `rescue_all_wrong` |
+| Trainer dispatch by style | `verl/trainer/ppo/ray_trainer_ts.py` (`trainer.teacher_rescue_style` = `legacy` / `prefix`) |
+| Teacher HTTP service (`/prefix_rescue` endpoint, independent `prefix_cache`) | `scripts/run_deepseek_flash_training_service.py` |
+| Launch wiring (env → Hydra overrides) | `train_multihopqa_branch_credit_dapo_step20_to30.sh`: `TEACHER_RESCUE_STYLE`, `TEACHER_RESCUE_PREFIX_HOPS`, `TEACHER_RESCUE_URL`, `TEACHER_RESCUE_KD_COEF` |
+| Concrete continuation launch (step28 → step40, resume from `global_step_28`) | `scripts/run_tracecredit_flash_prefixrescue_step28_to40.sh` |
+| Earlier continuation/ablation launchers | `scripts/run_tracecredit_flash_prefixrescue_sft350_step12_to20.sh`, `scripts/run_tracecredit_flash_semantic_rescue_sft350_step12_to20_resume.sh` |
+| Offline RescueRate evaluation (prefix vs fresh-resample arms) | `scripts/evaluation/evaluate_direct_prefix_teacher.py` |
+
+### Services and launch
+
+- Retriever (shared by student and teacher): `http://127.0.0.1:8002`.
+- Prefix teacher service (DeepSeek Flash, `/prefix_rescue`): `http://127.0.0.1:8131`,
+  started from `scripts/run_deepseek_flash_training_service.py`. The legacy
+  rescue service keeps running on `8130`.
+- Key env vars in the prefix launcher: `TEACHER_RESCUE_ENABLED=true`,
+  `TEACHER_RESCUE_STYLE=prefix`, `TEACHER_RESCUE_PREFIX_HOPS=2`,
+  `TEACHER_RESCUE_URL=http://127.0.0.1:8131`,
+  `SELF_OPD_COEF=1.0`, `TOTAL_TRAINING_STEPS=41`, `RESUME_GLOBAL_STEP=28`.
+- Resume is weights-only from
+  `verl_checkpoints/tracecredit-opid-flash-semantic-rescue-sft350-step0to20-20260929/actor/global_step_28`
+  (optimizer state re-initialised, matching this repository's convention).
+- The prefix style is opt-in; omitting `TEACHER_RESCUE_STYLE` keeps the legacy
+  closed-loop rescue path byte-for-byte unchanged.
+
+### Known edge case
+
+If teacher observations + student continuation exceed `max_start_length`, the
+existing keep-tail trajectory truncation can drop the hop-1 head; such groups
+fail the hop-1 prefix check and are safely skipped (treated like any all-wrong
+group). Observed rate ~7% of eligible groups.
+
 ## 7B experiment handoff: 4 x A40 40GB
 
 The recommended next experiment scales the current multi-hop Tree-GRPO setup

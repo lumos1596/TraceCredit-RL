@@ -22,6 +22,60 @@ LEGACY_FIELDS = {"failure_type", "missing_relation", "next_operation", "stop_con
 OPID_FIELDS = {"episode_summary", "episode_skill", "step_skills"}
 
 
+import re as _re
+
+SCOUT_SYSTEM = (
+    "You are the retrieval scout for a weaker question-answering student. "
+    "The student must answer a multi-hop question by itself. You perform only "
+    "the first {hops} retrieval hops. On every turn output exactly two blocks "
+    "and nothing else:\n"
+    "<think>one or two sentences stating which entity or relation this hop "
+    "must resolve, using only the question and the visible snippets</think>\n"
+    "<search>one concise factual web search query (3-30 words)</search>\n"
+    "Rules: never state a final answer; do not conclude for the student; each "
+    "query must be self-contained; output no text outside the two blocks."
+)
+_TAG_RE = _re.compile(r"<[^>]+>")
+_FALLBACK_THINK = "I will retrieve the next relation needed to answer the question."
+
+
+def _parse_scout_hop(text: str) -> tuple[str, str] | None:
+    """Tolerant think+search parse (independent block locations, fence-safe)."""
+    text = _re.sub(r"^```(?:json|html|text)?\s*|\s*```$", "", text.strip(), flags=_re.I)
+    think_match = _re.search(r"<think>\s*(.*?)\s*</think>", text, _re.S | _re.I)
+    search_match = _re.search(r"<search>\s*(.*?)\s*</search>", text, _re.S | _re.I)
+    if not search_match:
+        return None
+    think = " ".join(think_match.group(1).split()) if think_match else _FALLBACK_THINK
+    query = " ".join(search_match.group(1).split()).strip('"').strip("'")
+    words = query.split()
+    if len(words) > 30:
+        query = " ".join(words[:30])
+    if len(query.split()) < 3 or len(query) > 240 or _TAG_RE.search(query):
+        return None
+    think = _re.sub(r"<answer>.*?</answer>", "", think, flags=_re.S | _re.I).strip() or _FALLBACK_THINK
+    return think, query
+
+
+def _scout_retrieve(retriever_url: str, query: str) -> list[str]:
+    body = json.dumps({"queries": [query], "topk": 3, "return_scores": True}).encode()
+    request = urllib.request.Request(
+        retriever_url, data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return [item["document"]["contents"]
+                for item in json.load(response)["result"][0]]
+
+
+def _scout_observation(documents: list[str]) -> str:
+    references = ""
+    for index, document in enumerate(documents, 1):
+        title, _, body_doc = document.partition("\n")
+        references += f"Doc {index}(Title: {title}) {body_doc}\n"
+    content = f"\n\n<information>{references.strip()}</information>\n\n"
+    return content[:3000]
+
+
 class FlashService:
     def __init__(self, args: argparse.Namespace) -> None:
         self.api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -32,6 +86,7 @@ class FlashService:
         self.skill_cache: dict[str, dict] = {}
         self.judge_cache: dict[str, dict] = {}
         self.rescue_cache: dict[str, dict] = {}
+        self.prefix_cache: dict[str, dict] = {}
 
     def _json_completion(self, prompt: str, max_tokens: int) -> dict:
         body = json.dumps({
@@ -131,11 +186,96 @@ class FlashService:
             self.rescue_cache[key] = result
         return result
 
+    def _chat_completion(self, messages: list[dict], max_tokens: int = 2048) -> str:
+        body = json.dumps({
+            "model": self.args.model,
+            "messages": messages,
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stream": False,
+        }).encode()
+        request = urllib.request.Request(
+            self.args.api_url, data=body,
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json"}, method="POST")
+        import time
+        last_error = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(request, timeout=self.args.timeout) as response:
+                    payload = json.loads(response.read().decode())
+                return payload["choices"][0]["message"].get("content") or ""
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if error.code == 429 or error.code >= 500:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+        raise RuntimeError(f"DeepSeek chat failed after retries: {last_error}")
+
+    def prefix_rescue(self, payload: dict) -> dict:
+        """Simple gold-free scout: first N hops as think+search (no evidence gate).
+
+        Returns {ok, hops:[{hop, think, query}], error}. Retrieval itself is
+        executed by the training manager so observation formatting stays on the
+        training path.
+        """
+        question = str(payload.get("question", "")).strip()
+        hops = int(payload.get("hops", 2))
+        if not question or not 1 <= hops <= 3:
+            return {"ok": False, "error": "invalid question or hops", "hops": []}
+        canonical = json.dumps({"question": question, "hops": hops},
+                               ensure_ascii=False, sort_keys=True)
+        key = hashlib.sha256(canonical.encode()).hexdigest()
+        with self.lock:
+            cached = self.prefix_cache.get(key)
+        if cached is not None:
+            return cached
+        messages = [
+            {"role": "system", "content": SCOUT_SYSTEM.format(hops=hops)},
+            {"role": "user", "content": f"Question: {question}\n\nProduce hop 1 now."},
+        ]
+        plan_hops = []
+        try:
+            for hop_index in range(1, hops + 1):
+                content = self._chat_completion(messages)
+                parsed = _parse_scout_hop(content)
+                if parsed is None:
+                    messages.append({"role": "assistant", "content": content[:1000]})
+                    messages.append({"role": "user", "content":
+                                     "Your previous output was invalid. Output exactly "
+                                     "<think>...</think><search>...</search>, query 3-30 words."})
+                    content = self._chat_completion(messages)
+                    parsed = _parse_scout_hop(content)
+                    if parsed is None:
+                        result = {"ok": False, "error": f"invalid_hop_{hop_index}", "hops": plan_hops}
+                        with self.lock:
+                            self.prefix_cache[key] = result
+                        return result
+                think, query = parsed
+                plan_hops.append({"hop": hop_index, "think": think, "query": query})
+                messages.append({"role": "assistant",
+                                 "content": f"<think>{think}</think>\n<search>{query}</search>"})
+                if hop_index < hops:
+                    docs = _scout_retrieve(self.args.retriever_url, query)
+                    obs = _scout_observation(docs)
+                    messages.append({"role": "user",
+                                     "content": f"Search results:\n{obs}\n\nProduce hop {hop_index + 1} now."})
+            result = {"ok": True, "hops": plan_hops}
+        except Exception as error:
+            result = {"ok": False, "error": f"{type(error).__name__}: {error}", "hops": plan_hops}
+        with self.lock:
+            self.prefix_cache[key] = result
+        return result
+
     def health(self) -> dict:
         with self.lock:
             return {"ok": True, "model": self.args.model,
                     "skill_cache": len(self.skill_cache), "judge_cache": len(self.judge_cache),
-                    "rescue_cache": len(self.rescue_cache), "retriever_url": self.args.retriever_url}
+                    "rescue_cache": len(self.rescue_cache),
+                    "prefix_cache": len(self.prefix_cache), "retriever_url": self.args.retriever_url}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -171,6 +311,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = {"judgments": self.service.judge(items)}
             elif path == "/rescue":
                 result = {"rescue": self.service.rescue(payload)}
+            elif path == "/prefix_rescue":
+                result = {"rescue": self.service.prefix_rescue(payload)}
             else:
                 return self.send_json(404, {"error": "not found"})
             self.send_json(200, result)

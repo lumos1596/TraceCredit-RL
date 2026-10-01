@@ -16,7 +16,7 @@ rollouts/
 wandb/
 verl_log/
 pipeline_state/
-evaluation/
+/evaluation/
 tests/
 services/
 
@@ -54,3 +54,4 @@ branch_outcome_prior_calibration_*.json
 .idea/
 .vscode/
 .DS_Store
+eval_outputs/
