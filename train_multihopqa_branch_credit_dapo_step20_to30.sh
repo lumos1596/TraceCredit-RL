@@ -3,11 +3,11 @@
 
 set -euo pipefail
 
-PROJECT_DIR=/home/luwa/Documents/Tree-GRPO
+PROJECT_DIR=${ROOT:-/home/luwa/Documents/Tree-GRPO}
 # Allow a machine-specific environment to be supplied by the launcher while
 # retaining the historical in-repository environment as the fallback.
 PYTHON_BIN=${PYTHON_BIN:-"$PROJECT_DIR/.conda/envs/treegrpo/bin/python"}
-DATA_DIR="$PROJECT_DIR/data/multihopqa_search_mixed_402020_20260830"
+DATA_DIR=${DATA_DIR:-"$PROJECT_DIR/data/multihopqa_search_mixed_402020_20260830"}
 MODEL_DIR=${MODEL_DIR:-"$PROJECT_DIR/verl_checkpoints/singlehopqa-sft-search-r1-qwen2.5-3b-instruct/global_step_350"}
 # An empty INIT_CHECKPOINT intentionally starts directly from MODEL_DIR.  This
 # is useful after converting a differently-sharded FSDP checkpoint to a normal
@@ -112,7 +112,7 @@ export WG_BACKEND=ray
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export RAY_gsc_rpc_server_reconnect_timeout_s=100
 # Permit a valid compiler to be supplied by the machine-specific launcher.
-export CC=${CC:-/home/luwa/.conda/envs/dsclr/bin/gcc}
+export CC=${CC:-cc}
 export TOKENIZERS_PARALLELISM=true
 export PYTHONUNBUFFERED=1
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1

@@ -132,26 +132,75 @@ root receives no branch advantage by `TreeNode`'s root-skipping path rule.
 | Legacy closed-loop rescue (unchanged, still the default style) | `search_r1/llm_agent/teacher_rescue.py`: `rescue_all_wrong` |
 | Trainer dispatch by style | `verl/trainer/ppo/ray_trainer_ts.py` (`trainer.teacher_rescue_style` = `legacy` / `prefix`) |
 | Teacher HTTP service (`/prefix_rescue` endpoint, independent `prefix_cache`) | `scripts/run_deepseek_flash_training_service.py` |
-| Launch wiring (env → Hydra overrides) | `train_multihopqa_branch_credit_dapo_step20_to30.sh`: `TEACHER_RESCUE_STYLE`, `TEACHER_RESCUE_PREFIX_HOPS`, `TEACHER_RESCUE_URL`, `TEACHER_RESCUE_KD_COEF` |
-| Concrete continuation launch (step28 → step40, resume from `global_step_28`) | `scripts/run_tracecredit_flash_prefixrescue_step28_to40.sh` |
+| Launch wiring (env → Hydra overrides) | `train_multihopqa_branch_credit_dapo_step20_to30.sh`: `ROOT`, `DATA_DIR`, `TEACHER_RESCUE_STYLE`, `TEACHER_RESCUE_PREFIX_HOPS`, `TEACHER_RESCUE_URL`, `TEACHER_RESCUE_KD_COEF` |
+| Concrete fresh-machine launch (SFT350, step 0 → step 40, no RL resume) | `scripts/run_tracecredit_flash_prefixrescue_sft350_step0_to40.sh` |
+| Local continuation launch (step28 → step40, weights-only resume from `global_step_28`) | `scripts/run_tracecredit_flash_prefixrescue_step28_to40.sh` |
 | Earlier continuation/ablation launchers | `scripts/run_tracecredit_flash_prefixrescue_sft350_step12_to20.sh`, `scripts/run_tracecredit_flash_semantic_rescue_sft350_step12_to20_resume.sh` |
 | Offline RescueRate evaluation (prefix vs fresh-resample arms) | `scripts/evaluation/evaluate_direct_prefix_teacher.py` |
 
-### Services and launch
+### Fresh-machine launch from SFT350
 
-- Retriever (shared by student and teacher): `http://127.0.0.1:8002`.
-- Prefix teacher service (DeepSeek Flash, `/prefix_rescue`): `http://127.0.0.1:8131`,
-  started from `scripts/run_deepseek_flash_training_service.py`. The legacy
-  rescue service keeps running on `8130`.
-- Key env vars in the prefix launcher: `TEACHER_RESCUE_ENABLED=true`,
-  `TEACHER_RESCUE_STYLE=prefix`, `TEACHER_RESCUE_PREFIX_HOPS=2`,
-  `TEACHER_RESCUE_URL=http://127.0.0.1:8131`,
-  `SELF_OPD_COEF=1.0`, `TOTAL_TRAINING_STEPS=41`, `RESUME_GLOBAL_STEP=28`.
-- Resume is weights-only from
-  `verl_checkpoints/tracecredit-opid-flash-semantic-rescue-sft350-step0to20-20260929/actor/global_step_28`
-  (optimizer state re-initialised, matching this repository's convention).
-- The prefix style is opt-in; omitting `TEACHER_RESCUE_STYLE` keeps the legacy
-  closed-loop rescue path byte-for-byte unchanged.
+Use `scripts/run_tracecredit_flash_prefixrescue_sft350_step0_to40.sh` for a new
+run. It starts at RL step 0 from the SFT checkpoint and does **not** load any
+intermediate RL checkpoint:
+
+- `MODEL_DIR=$ROOT/verl_checkpoints/singlehopqa-sft-search-r1-qwen2.5-3b-instruct/global_step_350`
+- `INIT_CHECKPOINT=""` (empty means start directly from `MODEL_DIR`)
+- `RESUME_GLOBAL_STEP=0`, `RESUME_ACTOR_STATE=false`
+- `TOTAL_TRAINING_STEPS=41` (run step 0 through step 40), `SAVE_FREQ=1`,
+  `TEST_FREQ=4`, `VAL_AT_END=true`
+- `TEACHER_RESCUE_ENABLED=true`, `TEACHER_RESCUE_STYLE=prefix`,
+  `TEACHER_RESCUE_PREFIX_HOPS=2`, `SELF_OPD_COEF=1.0`
+
+Required files on the new machine:
+
+```text
+$ROOT/data/multihopqa_search_mixed_402020_20260830/train.parquet
+$ROOT/data/multihopqa_search_mixed_402020_20260830/balanced_test.parquet
+$ROOT/verl_checkpoints/singlehopqa-sft-search-r1-qwen2.5-3b-instruct/global_step_350/
+```
+
+The launcher derives `ROOT` from its own path, so it normally finds the data and
+SFT350 checkpoint after cloning/copying the repository into the same root. Set
+`ROOT`, `DATA_DIR`, or `MODEL_DIR` explicitly if the layout differs. The
+default Python is `$ROOT/.conda/envs/treegrpo/bin/python`; override `PYTHON_BIN`
+if the environment is elsewhere.
+
+Start the two local services first. Configure and start the retriever as
+described in [Start a retrieval service](#start-a-retrieval-service), using
+port `8002`. Then, from the repository root with the training environment
+activated, start one Flash service on `8130`; this single process serves
+`/generate` (Self-OPD analyzer), `/semantic_judge`, and `/prefix_rescue`:
+
+```bash
+cd /path/to/Tree-GRPO
+export DEEPSEEK_API_KEY=...
+python scripts/run_deepseek_flash_training_service.py \
+  --host 127.0.0.1 \
+  --port 8130 \
+  --retriever-url http://127.0.0.1:8002/retrieve
+```
+
+Launch training in another shell:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+bash scripts/run_tracecredit_flash_prefixrescue_sft350_step0_to40.sh
+```
+
+If services run on another host, override both URLs:
+
+```bash
+FLASH_SERVICE_URL=http://<service-host>:8130 \
+RETRIEVER_URL=http://<service-host>:8002/retrieve \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+bash scripts/run_tracecredit_flash_prefixrescue_sft350_step0_to40.sh
+```
+
+`scripts/run_tracecredit_flash_prefixrescue_step28_to40.sh` remains only the
+machine-specific continuation script for the existing step28 run. The prefix
+style is opt-in; omitting `TEACHER_RESCUE_STYLE` keeps the legacy closed-loop
+rescue path unchanged.
 
 ### Known edge case
 
